@@ -1,0 +1,36 @@
+{
+  "name": "pi-smart-router",
+  "version": "0.1.0",
+  "description": "Smart model routing for pi — route across models by task type, context size, tools, and failure state, with rule engine, model-chain fallback, and failure cooldown. Logic distilled from claude-code-router.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi",
+    "pi-package",
+    "pi-extension",
+    "model-routing",
+    "router",
+    "claude-code-router",
+    "llm"
+  ],
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*",
+    "typescript": "^5.5.0"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  }
+}

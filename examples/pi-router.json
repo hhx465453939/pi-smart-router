@@ -1,0 +1,67 @@
+{
+  "enabled": true,
+  "defaultModel": "anthropic/claude-sonnet-4-5",
+  "routingLevel": "turn",
+  "cooldownMs": 60000,
+  "failure": {
+    "cooldownOnStatus": [429, 500, 502, 503, 504],
+    "cooldownOnToolErrorPatterns": [
+      "rate.?limit",
+      "context.?length",
+      "overloaded",
+      "too.?many.?requests",
+      "service.?unavailable",
+      "timeout",
+      "429",
+      "503"
+    ]
+  },
+  "taskTypeRules": {
+    "code": ["implement", "fix", "bug", "refactor", "function", "api", "test", "type", "error", "compile", "stack", "trace"],
+    "document": ["document", "readme", "doc", "explain", "summarize", "write", "draft"],
+    "research": ["research", "investigate", "analyze", "compare", "find", "search", "explore", "audit"]
+  },
+  "rules": [
+    {
+      "id": "code-task",
+      "name": "编码任务用强模型",
+      "priority": 100,
+      "when": { "taskType": "code" },
+      "model": "anthropic/claude-opus-4-5"
+    },
+    {
+      "id": "long-context",
+      "name": "长上下文用大窗口模型",
+      "priority": 90,
+      "when": { "contextTokens": { "gt": 80000 } },
+      "model": "openrouter/anthropic/claude-sonnet-4"
+    },
+    {
+      "id": "image-task",
+      "name": "多模态任务",
+      "priority": 95,
+      "when": { "hasImage": true },
+      "model": "openai/gpt-5.1"
+    },
+    {
+      "id": "later-turns",
+      "name": "多轮后切稳态模型",
+      "priority": 10,
+      "when": { "turnIndex": { "gte": 6 } },
+      "model": "anthropic/claude-sonnet-4-5"
+    }
+  ],
+  "fallback": {
+    "mode": "model-chain",
+    "models": ["openrouter/anthropic/claude-sonnet-4", "deepseek/deepseek-v4", "anthropic/claude-sonnet-4-5"]
+  },
+  "explicitModelPrefix": "@model:",
+  "verbose": false,
+  "cache": {
+    "enabled": true,
+    "preferCache": true,
+    "minHitChars": 1024,
+    "sticky": true,
+    "stickyTtlMs": 300000
+  }
+}
