@@ -96,8 +96,8 @@ export default function (pi: ExtensionAPI) {
     const out: Array<{ selector: string; provider: string; baseUrl?: string; contextWindow?: number; cost?: { input: number; output: number; cacheRead: number }; input?: string[] }> = [];
     try {
       const reg: unknown = (ctx as unknown as Record<string, unknown>).modelRegistry;
-      const r = reg as { getAvailableSnapshot?: () => Array<Record<string, unknown>> };
-      const list = r.getAvailableSnapshot?.() ?? [];
+      const r = reg as { getAvailableSnapshot?: () => Array<Record<string, unknown>>; getAvailable?: () => Array<Record<string, unknown>> };
+      const list = r.getAvailableSnapshot?.() ?? r.getAvailable?.() ?? [];
       for (const m of list as Array<Record<string, unknown>>) {
         const provider = String(m.provider ?? "");
         const id = String(m.id ?? "");
@@ -243,8 +243,8 @@ export default function (pi: ExtensionAPI) {
       // 只对"实际可用"的模型做画像（getAvailableSnapshot = 有 auth 的），
       // 避免 pi 内置全球目录（amazon/azure/cloudflare 等未接入 provider）混入 rank
       const reg: unknown = (ctx as unknown as Record<string, unknown>).modelRegistry;
-      const r = reg as { getAvailableSnapshot?: () => RegistryModel[]; getAll?: () => RegistryModel[] };
-      const all = r.getAvailableSnapshot?.() ?? r.getAll?.() ?? [];
+      const r = reg as { getAvailableSnapshot?: () => RegistryModel[]; getAll?: () => RegistryModel[]; getAvailable?: () => RegistryModel[] };
+      const all = r.getAvailableSnapshot?.() ?? r.getAvailable?.() ?? r.getAll?.() ?? [];
       for (const m of all) {
         if (!m?.provider || !m?.id) continue;
         // 运行时快照缺 cost 时，用 models-store 真实定价补充
@@ -706,7 +706,12 @@ export default function (pi: ExtensionAPI) {
       if (cmd === "pool") {
         // 模型池多选器：搜索 + 空格勾选 + 回车保存到全局配置
         const infos = registryInfos(ctx as unknown as ExtensionContext);
-        if (!infos.length) { ctx.ui.notify("router: 无可用模型（modelRegistry 为空）", "warning"); return; }
+        // 兑底：registry 元信息拿不到时，用 availableSelectors 字符串构造基础条目（无窗口/价格但可挑选）
+        if (!infos.length) {
+          const sels = [...availableSelectors(ctx as unknown as ExtensionContext)];
+          if (!sels.length) { ctx.ui.notify("router: 无可用模型（modelRegistry 为空）", "warning"); return; }
+          for (const s of sels) infos.push({ selector: s, provider: s.split("/")[0] ?? "" });
+        }
         const items: PoolItem[] = infos.map((i) => ({ selector: i.selector, contextWindow: i.contextWindow, costInput: i.cost?.input }));
         const cfgNow = watcher?.get() ?? loadConfig(ctx.cwd);
         const initial = new Set((cfgNow.pool ?? []).map((s) => s.toLowerCase()));
