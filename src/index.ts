@@ -25,6 +25,9 @@ import { AvailabilityProbe } from "./probe/availability.ts";
 import { analyzeTask } from "./engine/difficulty.ts";
 import { profileModel, rankModels, valueScore, type ModelProfile, type RegistryModel } from "./engine/profile.ts";
 import type { Difficulty } from "./types.ts";
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 export default function (pi: ExtensionAPI) {
   let watcher: ConfigWatcher | null = null;
@@ -116,17 +119,46 @@ export default function (pi: ExtensionAPI) {
   }
 
   /** auto-profiling：遍历全部已注册模型，生成画像（含未在 available 的） */
+  /** 读取 pi models-store.json 作为真实 cost 补充源（运行时快照可能缺 cost） */
+  function storeCosts(): Map<string, { input: number; output: number; cacheRead: number }> {
+    const out = new Map<string, { input: number; output: number; cacheRead: number }>();
+    try {
+      const f = join(homedir(), ".pi/agent/models-store.json");
+      if (!existsSync(f)) return out;
+      const d = JSON.parse(readFileSync(f, "utf8")) as Record<string, { models?: Array<Record<string, unknown>> }>;
+      for (const [prov, v] of Object.entries(d)) {
+        if (!v?.models) continue;
+        for (const m of v.models) {
+          const id = String(m.id ?? "");
+          const c = m.cost as { input?: number; output?: number; cacheRead?: number } | undefined;
+          if (!id || !c || typeof c.input !== "number") continue;
+          out.set(`${prov}/${id}`, { input: c.input, output: c.output ?? 0, cacheRead: c.cacheRead ?? 0 });
+        }
+      }
+    } catch { /* ignore */ }
+    return out;
+  }
+
   function registryProfiles(ctx: ExtensionContext): { profiles: ModelProfile[]; targets: Array<{ selector: string; provider: string; baseUrl?: string }> } {
     const profiles: ModelProfile[] = [];
     const targets: Array<{ selector: string; provider: string; baseUrl?: string }> = [];
+    const costs = storeCosts();
     try {
+      // 只对"实际可用"的模型做画像（getAvailableSnapshot = 有 auth 的），
+      // 避免 pi 内置全球目录（amazon/azure/cloudflare 等未接入 provider）混入 rank
       const reg: unknown = (ctx as unknown as Record<string, unknown>).modelRegistry;
-      const r = reg as { getAll?: () => RegistryModel[] };
-      const all = r.getAll?.() ?? [];
+      const r = reg as { getAvailableSnapshot?: () => RegistryModel[]; getAll?: () => RegistryModel[] };
+      const all = r.getAvailableSnapshot?.() ?? r.getAll?.() ?? [];
       for (const m of all) {
         if (!m?.provider || !m?.id) continue;
-        profiles.push(profileModel(m));
-        targets.push({ selector: `${m.provider}/${m.id}`, provider: m.provider, baseUrl: (m as unknown as Record<string, unknown>).baseUrl as string | undefined });
+        // 运行时快照缺 cost 时，用 models-store 真实定价补充
+        const selector = `${m.provider}/${m.id}`;
+        const storeCost = costs.get(selector);
+        const model: RegistryModel = storeCost
+          ? { ...m, cost: { input: storeCost.input, output: storeCost.output, cacheRead: storeCost.cacheRead } }
+          : m;
+        profiles.push(profileModel(model));
+        targets.push({ selector, provider: m.provider, baseUrl: (m as unknown as Record<string, unknown>).baseUrl as string | undefined });
       }
     } catch { /* ignore */ }
     return { profiles, targets };
