@@ -23,6 +23,8 @@ import { ModelCatalog } from "./catalog/catalog.ts";
 import { SelfLearnManager } from "./engine/selflearn.ts";
 import { AvailabilityProbe } from "./probe/availability.ts";
 import { analyzeTask } from "./engine/difficulty.ts";
+import { profileModel, rankModels, valueScore, type ModelProfile, type RegistryModel } from "./engine/profile.ts";
+import type { Difficulty } from "./types.ts";
 
 export default function (pi: ExtensionAPI) {
   let watcher: ConfigWatcher | null = null;
@@ -33,6 +35,7 @@ export default function (pi: ExtensionAPI) {
   let catalog: ModelCatalog | null = null;
   let selfLearn: SelfLearnManager | null = null;
   let probe: AvailabilityProbe | null = null;
+  let profiles: ModelProfile[] = [];
   let history: DecisionRecord[] = [];
   let turnIndex = 0;
   let lastPromptText = "";
@@ -112,6 +115,21 @@ export default function (pi: ExtensionAPI) {
     } catch { return undefined; }
   }
 
+  /** auto-profiling：遍历全部已注册模型，生成画像（含未在 available 的） */
+  function registryProfiles(ctx: ExtensionContext): ModelProfile[] {
+    const out: ModelProfile[] = [];
+    try {
+      const reg: unknown = (ctx as unknown as Record<string, unknown>).modelRegistry;
+      const r = reg as { getAll?: () => RegistryModel[] };
+      const all = r.getAll?.() ?? [];
+      for (const m of all) {
+        if (!m?.provider || !m?.id) continue;
+        out.push(profileModel(m));
+      }
+    } catch { /* ignore */ }
+    return out;
+  }
+
   function contextTokens(ctx: ExtensionContext): number | undefined {
     try {
       const u = (ctx as unknown as { getContextUsage?: () => { tokens?: number } }).getContextUsage?.();
@@ -157,6 +175,8 @@ export default function (pi: ExtensionAPI) {
       const regInfos = registryInfos(ctx);
       catalog.ensureSeed(regInfos);
       selfLearn = new SelfLearnManager(catalog, cfg.selfLearn);
+      // auto-profiling：遍历全部已注册模型生成画像（含未 available 的）
+      profiles = registryProfiles(ctx);
       // 初始化可用性探测 + 启动后台异步探测（不阻塞）
       probe = new AvailabilityProbe({
         config: cfg.probe,
@@ -212,6 +232,22 @@ export default function (pi: ExtensionAPI) {
     const promptText = (event as unknown as { prompt?: string }).prompt ?? "";
     lastPromptText = promptText;
     lastTaskType = (event as unknown as { systemPromptOptions?: { taskType?: string } }).systemPromptOptions?.taskType ?? classifyGuess(promptText);
+    // auto-rank：按当前难度把画像好的模型并入候选（让 fallback 层能自动选到，无需手写规则）
+    if (cfg.difficulty.enabled && profiles.length) {
+      const { difficulty } = analyzeTask(
+        { taskType: lastTaskType as never, toolNames: [], contextTokens: contextTokens(ctx), messageCount: messageCount(ctx), turnIndex, promptLength: promptText.length, hasImage: false, explicitModel: undefined, currentModel: cur, thinkingLevel: undefined, promptText },
+        cfg.difficulty.lowThreshold,
+        cfg.difficulty.highThreshold,
+      );
+      const ranked = rankModels(profiles, difficulty, (sel) => {
+        const rec = catalog?.get(sel);
+        if (!rec) return 0;
+        const k = `${lastTaskType}×${difficulty}`;
+        return rec.learnScore[k] ?? 0;
+      });
+      // 并入前 8 名画像候选（与 available 求并集）
+      for (const p of ranked.slice(0, 8)) availableFiltered.add(p.selector);
+    }
 
     const rec = resolveTurnDecision({
       prompt: promptText,
@@ -272,6 +308,10 @@ export default function (pi: ExtensionAPI) {
       if (!ok) {
         console.warn(`[pi-smart-router] setModel failed (no auth): ${rec.selector}`);
         return;
+      }
+      // 应用规则建议的思考级别（若带）
+      if (rec.thinkingLevel) {
+        try { pi.setThinkingLevel(rec.thinkingLevel); } catch (err) { console.warn(`[pi-smart-router] setThinkingLevel failed: ${err}`); }
       }
       pushDecision(rec, ctx);
       if (cfg.verbose) ctx.ui.notify(`⚡ router: ${cur ?? "?"} → ${rec.selector} — ${rec.reason}`, "info");
@@ -521,6 +561,19 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify(lines.join("\n"), "info");
         return;
       }
+      if (cmd === "value") {
+        if (!profiles.length) { ctx.ui.notify("profiles not loaded yet (run a turn first)", "info"); return; }
+        const lines = [`model value rank (${profiles.length} auto-profiled):`];
+        const diffArg = (rest[0] ?? "low").toLowerCase() as Difficulty;
+        const diff = (["low", "medium", "high"] as const).includes(diffArg as never) ? diffArg : "low";
+        const ranked = rankModels(profiles, diff, (sel) => catalog?.get(sel)?.learnScore[`${lastTaskType}×${diff}`] ?? 0);
+        for (const p of ranked.slice(0, 15)) {
+          const v = valueScore(p, diff, catalog?.get(p.selector)?.learnScore[`${lastTaskType}×${diff}`] ?? 0);
+          lines.push(`  ${v.toFixed(1)}  ${p.selector}  [${p.priceTier}/${p.capabilityTier}/${p.speed}] ctx=${p.contextWindow} $${p.costInput}/${p.costOutput}`);
+        }
+        ctx.ui.notify(lines.join("\n"), "info");
+        return;
+      }
       if (cmd === "probe") {
         if (!probe) { ctx.ui.notify("probe not initialized", "warning"); return; }
         const snap = probe.getSnapshot();
@@ -613,6 +666,7 @@ export default function (pi: ExtensionAPI) {
           "  cache            — show per-model cache hit stats",
           "  learn            — show per-taskType learned model scores",
           "  catalog          — show model catalog + self-learn scores",
+          "  value [low|mid|high] — auto-profiled model value rank",
           "  probe            — show availability snapshot",
           "  handoff          — show recent handoff events",
           "  reload           — reload config from pi-router.json",

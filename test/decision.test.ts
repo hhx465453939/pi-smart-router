@@ -64,6 +64,21 @@ describe("decide", () => {
     assert.equal(d.source, "rule");
   });
 
+  it("rule hit propagates thinkingLevel", () => {
+    const c = cfg({ rules: [{ id: "codex-low", when: { taskType: "code" }, model: "openai-codex/gpt-5.6-sol", thinkingLevel: "low" }] });
+    const compiled = compileRules(c.rules).compiled;
+    const d = decide({ features: feat(), config: c, compiledRules: compiled, cooldowns: new CooldownSet(), availableModels: new Set(["openai-codex/gpt-5.6-sol"]) });
+    assert.equal(d.selector, "openai-codex/gpt-5.6-sol");
+    assert.equal(d.thinkingLevel, "low");
+  });
+
+  it("rule without thinkingLevel leaves it undefined", () => {
+    const c = cfg({ rules: [{ id: "code-rule", when: { taskType: "code" }, model: "anthropic/claude-opus-4-5" }] });
+    const compiled = compileRules(c.rules).compiled;
+    const d = decide({ features: feat(), config: c, compiledRules: compiled, cooldowns: new CooldownSet(), availableModels: new Set(["anthropic/claude-opus-4-5"]) });
+    assert.equal(d.thinkingLevel, undefined);
+  });
+
   it("rule hit but cooling → fallback", () => {
     const c = cfg({
       rules: [{ id: "code-rule", when: { taskType: "code" }, model: "anthropic/claude-opus-4-5" }],

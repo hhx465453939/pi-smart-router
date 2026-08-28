@@ -274,6 +274,8 @@ export interface RouteDecision {
   source: "explicit" | "cooldown-avoid" | "rule" | "default" | "keep";
   /** 决策时间戳 */
   timestamp: number;
+  /** 命中规则建议的思考级别（若有，切换模型后应用） */
+  thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 }
 
 /** 决策历史条目（持久化到会话） */

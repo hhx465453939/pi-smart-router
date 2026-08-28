@@ -41,6 +41,20 @@ pi 通过 `sessionId` 前缀缓存（Anthropic `cache_control` / OpenAI `prompt_
 - **可用性探测（三层）**：① 无 key 模型立即排除；② 启动后台异步连通性探测（不阻塞聊天，timeout 5 分钟）；③ 真实调用捕获 401/402/403（套餐失效/欠费）→ 本 session 确定性排除
 - **router_handoff 工具**：当前模型可主动把工作交接给更适合的模型（`router_handoff(target, reason, summary)`），上下文/缓存无缝保留，交接结果喂 self-learn
 
+### v0.4.0：auto-profiling — 全部模型自动入 rank
+
+> **把能看见的模型，都自动去看、自动纳入路由 rank。**
+
+- **自动遍历**：启动时用 `modelRegistry.getAll()` 遍历**全部已注册模型**（覆盖 models.json / extensions / providers 所有来源，含未在可用列表的），不依赖手写规则
+- **自动画像**：每个模型自动生成 `[价格档/能力档/速度档] + 长上下文 + 多模态 + 性价比评分`：
+  - 价格档：按 cost.input（$/M）→ cheap(<0.5) / medium(<5) / expensive
+  - 能力档：ID 启发式（pro/codex/k3/max/sol→high；flash/highspeed/mini→low）
+  - 速度档：flash/highspeed/1m→fast
+- **自动入 rank**：决策时按当前难度对全部模型算 value score 并入候选，fallback 层自动选到"性价比最优"的模型；self-learn 实测在其上叠加修正
+- **`/router value [low|middle]high]`**：查看全部模型的性价比排名（画像 + 价格 + 窗口一眼可见）
+
+> 💡 例：low 难度 `glm-5.3-flash`（$0.075/$0.25）排最前，`gpt-5.6-luna`（$0.2 低成本思考）也靠前；high 难度 `k3-256k`/`deepseek-v4-pro`/`kimi-k3` 居前。
+
 详见 `tasks/CHG-003/SPEC.md` 的 ADR-009~013。
 
 ## 为什么
@@ -100,7 +114,8 @@ cp examples/pi-router.cn.json ~/.pi/agent/pi-router.json
 ```jsonc
 {
   "enabled": true,
-  "defaultModel": "anthropic/claude-sonnet-4-5",
+  // 默认（一般任务拓荒）用便宜快模型
+  "defaultModel": "volces/deepseek-v4-flash[1m]",
   "routingLevel": "turn", // turn | request | both
   "cooldownMs": 60000,
   "failure": {
@@ -111,24 +126,47 @@ cp examples/pi-router.cn.json ~/.pi/agent/pi-router.json
     "code": ["implement", "fix", "bug", "refactor"],
     "document": ["readme", "doc", "explain"]
   },
+  // 规则：按场景分配（配合 self-learn 收敛最性价比模型）
   "rules": [
     {
-      "id": "code-task",
-      "name": "编码任务用强模型",
+      "id": "frontend-task",
+      "name": "前端任务用 k3-256k",
+      "priority": 110,
+      "when": { "prompt": { "contains": "react" } },
+      "model": "kimi-coding/k3-256k"
+    },
+    {
+      "id": "ops-debug",
+      "name": "运维/debug 用 codex 5.6-sol (low thinking)",
+      "priority": 105,
+      "when": { "taskType": "code", "prompt": { "contains": "debug" } },
+      "model": "openai-codex/gpt-5.6-sol",
+      "thinkingLevel": "low"   // 规则可带思考级别，切换模型后自动应用
+    },
+    {
+      "id": "complex-backend",
+      "name": "复杂后端逻辑用 glm-5.3",
       "priority": 100,
       "when": { "taskType": "code" },
-      "model": "anthropic/claude-opus-4-5"
+      "model": "zai-coding-cn/glm-5.3"
     },
     {
       "id": "long-context",
       "priority": 90,
-      "when": { "contextTokens": { "gt": 80000 } },
-      "model": "openrouter/anthropic/claude-sonnet-4"
+      "when": { "contextTokens": { "gt": 100000 } },
+      "model": "zai-coding-cn/glm-5.3"
+    },
+    {
+      "id": "huge-context",
+      "name": "超长上下文用 1M 窗口",
+      "priority": 92,
+      "when": { "contextTokens": { "gt": 150000 } },
+      "model": "volces/deepseek-v4-flash[1m]"
     }
   ],
   "fallback": {
     "mode": "model-chain", // off | retry | model-chain
-    "models": ["openrouter/anthropic/claude-sonnet-4", "deepseek/deepseek-v4"]
+    "models": ["volces/deepseek-v4-flash[1m]", "zai-coding-cn/glm-5.3", "opencode-go/deepseek-v4-pro"]
   },
   "explicitModelPrefix": "@model:",
   "verbose": false,
@@ -138,9 +176,14 @@ cp examples/pi-router.cn.json ~/.pi/agent/pi-router.json
     "minHitChars": 1024,
     "sticky": true,
     "stickyTtlMs": 300000
-  }
+  },
+  "difficulty": { "enabled": true, "lowThreshold": 40, "highThreshold": 120 },
+  "selfLearn": { "enabled": true, "minSamples": 3, "decay": 0.9 },
+  "probe": { "enabled": true, "timeoutMs": 300000, "probeOnStart": true, "excludeUnavailable": true }
 }
 ```
+
+> 💡 规则命中后若配置了 `thinkingLevel`，扩展在切换模型时会一并应用（如 `gpt-5.6-sol` 配 `"low"` 即 codex 低思考模式）。
 
 ### 条件语法（when）
 
@@ -208,6 +251,7 @@ cp examples/pi-router.cn.json ~/.pi/agent/pi-router.json
 /router cache           — 每模型缓存命中统计
 /router learn           — 每 taskType 学习得分
 /router catalog         — 模型能力快照 + self-learn 得分
+/router value [难度]    — 全部模型自动画像性价比排名
 /router probe           — 本 session 可用性探测快照
 /router handoff         — 最近交接事件
 /router reload          — 从 pi-router.json 热加载配置
@@ -267,7 +311,7 @@ src/
 ## 开发
 
 ```bash
-npm test        # node --test（引擎单测，108 tests，含 cache/learn/churn/catalog/difficulty/selflearn/probe）
+npm test        # node --test（引擎单测，118 tests，含 cache/learn/churn/catalog/difficulty/selflearn/probe/profile）
 npm run typecheck  # tsc --noEmit
 ```
 

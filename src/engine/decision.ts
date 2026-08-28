@@ -122,14 +122,14 @@ export function decide(input: DecisionInput): RouteDecision {
       }
       // 冷却但无 fallback 可用，仍返回原命中并由调用方决定是否保持当前
       if (isAvailable(desired, availableModels)) {
-        return { selector: desired, reason: `rule "${matched.id}" hit → "${desired}" (cooling, no fallback)`, ruleId: matched.id, source: "rule", timestamp: now };
+        return { selector: desired, reason: `rule "${matched.id}" hit → "${desired}" (cooling, no fallback)`, ruleId: matched.id, source: "rule", timestamp: now, thinkingLevel: matched.thinkingLevel };
       }
       return { selector: undefined, reason: `rule "${matched.id}" hit but model "${desired}" unavailable/cooling`, ruleId: matched.id, source: "rule", timestamp: now };
     }
 
     if (isAvailable(desired, availableModels)) {
-      // 规则命中：尊重规则（即便 churn 大，规则优先）；reason 标注 churn
-      return { selector: desired, reason: `rule "${matched.id}" → ${desired}${churnNote(desired)}`, ruleId: matched.id, source: "rule", timestamp: now };
+      // 规则命中：尊重规则（即便 churn 大，规则优先）；reason 标注 churn；带 thinkingLevel
+      return { selector: desired, reason: `rule "${matched.id}" → ${desired}${churnNote(desired)}`, ruleId: matched.id, source: "rule", timestamp: now, thinkingLevel: matched.thinkingLevel };
     }
     // 规则命中但模型不可用 → 尝试 fallback（缓存感知）
     const alt = fallbackAvailable(config, cooldowns, availableModels, isCacheAware ? cacheManager : undefined, sid, prompt);

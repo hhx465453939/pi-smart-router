@@ -87,10 +87,11 @@
     },
     {
       "id": "ops-debug",
-      "name": "运维/debug 推 codex",
+      "name": "运维/debug 推 codex 5.6-sol (low thinking)",
       "priority": 105,
       "when": { "taskType": "code", "prompt": { "contains": "debug" } },
-      "model": "openai-codex/gpt-5.3-codex-spark"
+      "model": "openai-codex/gpt-5.6-sol",
+      "thinkingLevel": "low"
     },
     {
       "id": "complex-backend",
@@ -109,10 +110,17 @@
     },
     {
       "id": "long-context",
-      "name": "长上下文用大窗口",
+      "name": "长上下文用 glm-5.3",
       "priority": 90,
       "when": { "contextTokens": { "gt": 100000 } },
-      "model": "kimi-coding/k3-256k"
+      "model": "zai-coding-cn/glm-5.3"
+    },
+    {
+      "id": "huge-context",
+      "name": "超长上下文用 1M 窗口",
+      "priority": 92,
+      "when": { "contextTokens": { "gt": 150000 } },
+      "model": "volces/deepseek-v4-flash[1m]"
     }
   ],
   "fallback": {
