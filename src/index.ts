@@ -121,6 +121,15 @@ export default function (pi: ExtensionAPI) {
   // 无痛切换：按当前场景/难度 rank 逐个试下一个可用模型，直至成功
   const recentFallbackTries = new Map<string, number>();
   const rateLimit429Count = new Map<string, number>();
+  /** 归一化 model id 到家族基准：去 provider 前缀、小写、去 [1m]/-0731 等变体后缀，使跨供应商同款可匹配 */
+  function normalizeModelBase(id: string): string {
+    return id
+      .toLowerCase()
+      .replace(/\[[^\]]*\]/g, "")          // [1m] [256k] 等
+      .replace(/-\d{3,4}(?=$|-)/g, "")      // -0731 / -0813 日期后缀
+      .replace(/[-_]+$/g, "")
+      .trim();
+  }
   async function tryImmediateFallback(failedSelector: string, ctx: ExtensionContext, reason: string): Promise<boolean> {
     const cfg = watcher?.get() ?? loadConfig(ctx.cwd);
     const available = availableSelectors(ctx);
@@ -157,7 +166,17 @@ export default function (pi: ExtensionAPI) {
     }
     recentFallbackTries.set(promptHash, tries + 1);
     setTimeout(() => recentFallbackTries.delete(promptHash), 60_000);
-    const next = ranked.find((s) => s.toLowerCase() !== failedSelector.toLowerCase());
+    const next = (() => {
+      // 同类模型优先（用户核心需求："秒切其他供应商的同类模型"）——
+      // volces/dsv4-flash[1m] 耗尽 → 优先 opencode/deepseek-v4-flash / shudie 同款，而非仅凭性价比选 minimax
+      const failedBase = normalizeModelBase(failedSelector.split("/").slice(1).join("/"));
+      const sameFamily = ranked.filter((s) => {
+        if (s.toLowerCase() === failedSelector.toLowerCase()) return false;
+        return normalizeModelBase(s.split("/").slice(1).join("/")) === failedBase;
+      });
+      if (sameFamily.length > 0) return sameFamily[0];
+      return ranked.find((s) => s.toLowerCase() !== failedSelector.toLowerCase());
+    })();
     if (!next) {
       ctx.ui.notify(`router: 无其他可用模型可切（${failedSelector} 已排除）`, "warning");
       return false;

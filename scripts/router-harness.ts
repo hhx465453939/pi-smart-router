@@ -60,6 +60,7 @@ const FAKE_MODELS = [
   { provider: "opencode", id: "deepseek-v4-flash", contextWindow: 1048576, cost: { input: 0.22, output: 0.66, cacheRead: 0.007 }, input: ["text"], reasoning: false },
   { provider: "shudie", id: "deepseek-v4-flash-0731", contextWindow: 262144, cost: { input: 0.14, output: 0.28, cacheRead: 0 }, input: ["text"], reasoning: false },
   { provider: "zai", id: "glm-5.3", contextWindow: 1000000, cost: { input: 1.4, output: 0, cacheRead: 0 }, input: ["text"], reasoning: false },
+  { provider: "opencode", id: "minimax-m3", contextWindow: 1048576, cost: { input: 0.3, output: 0, cacheRead: 0 }, input: ["text"], reasoning: true },
 ];
 
 const FAKE_CONFIG = {
