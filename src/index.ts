@@ -120,6 +120,7 @@ export default function (pi: ExtensionAPI) {
 
   // 无痛切换：按当前场景/难度 rank 逐个试下一个可用模型，直至成功
   const recentFallbackTries = new Map<string, number>();
+  const rateLimit429Count = new Map<string, number>();
   async function tryImmediateFallback(failedSelector: string, ctx: ExtensionContext, reason: string): Promise<boolean> {
     const cfg = watcher?.get() ?? loadConfig(ctx.cwd);
     const available = availableSelectors(ctx);
@@ -488,6 +489,25 @@ export default function (pi: ExtensionAPI) {
         probe.markAuthFailure(sel);
         ctx.ui.notify(`⚡ router: ${sel} auth failed (HTTP ${event.status}) — excluded this session`, "warning");
         void tryImmediateFallback(sel, ctx, `HTTP ${event.status}`);
+      }
+    }
+    // 可用性：连续 429 → 判定额度耗尽/严重限流，标 unavailable + 长冷却 + 无痛秒切（换供应商同类模型）
+    if (cfg.probe.enabled && event.status === 429) {
+      const sel = currentSelector(ctx);
+      if (sel && probe) {
+        const n = (rateLimit429Count.get(sel) ?? 0) + 1;
+        rateLimit429Count.set(sel, n);
+        // 同一模型连续 2 次 429（pi 内部 retry 也会触发多次）→ 视为额度耗尽而非瞬时限流
+        if (n >= 2) {
+          probe.markAuthFailure(sel);
+          cooldowns.add(sel, 60 * 60 * 1000, `429×${n} quota/rate exhausted`);
+          ctx.ui.notify(`⚡ router: ${sel} 连续 ${n} 次 429 — 本 session 排除，秒切其他供应商`, "warning");
+          rateLimit429Count.delete(sel);
+          void tryImmediateFallback(sel, ctx, "429 rate/quota exhausted");
+        } else {
+          // 首次 429：短暂标记 uncertain 防立即重选，60s 后自动清除
+          setTimeout(() => rateLimit429Count.delete(sel), 60_000);
+        }
       }
     }
     // self-learn 失败记录

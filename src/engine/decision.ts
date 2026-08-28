@@ -128,6 +128,14 @@ export function decide(input: DecisionInput): RouteDecision {
     }
 
     if (isAvailable(desired, availableModels)) {
+      // probe 标记 unavailable（套餐失效/额度耗尽）→ 不切过去，走 fallback 换供应商同类模型
+      if (probe && probe.getAvailability(desired) === "unavailable") {
+        const alt = fallbackAvailable(config, cooldowns, availableModels, isCacheAware ? cacheManager : undefined, sid, prompt);
+        if (alt) {
+          return { selector: alt, reason: `rule "${matched.id}" → ${desired} unavailable (quota/auth) → fallback "${alt}"`, ruleId: matched.id, source: "cooldown-avoid", timestamp: now, thinkingLevel: matched.thinkingLevel };
+        }
+        return { selector: undefined, reason: `rule "${matched.id}" → ${desired} unavailable, no fallback`, ruleId: matched.id, source: "rule", timestamp: now };
+      }
       // 规则命中：尊重规则（即便 churn 大，规则优先）；reason 标注 churn；带 thinkingLevel
       return { selector: desired, reason: `rule "${matched.id}" → ${desired}${churnNote(desired)}`, ruleId: matched.id, source: "rule", timestamp: now, thinkingLevel: matched.thinkingLevel };
     }
