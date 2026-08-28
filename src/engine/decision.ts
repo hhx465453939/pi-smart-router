@@ -10,6 +10,9 @@ import { pickAvailableModel, createExecutionPlan } from "./planner.ts";
 import { type CompiledRule, matchFirstRule } from "./rules.ts";
 import type { CacheManager } from "./cache.ts";
 import type { LearningManager } from "./learn.ts";
+import type { SelfLearnManager } from "./selflearn.ts";
+import { analyzeTask } from "./difficulty.ts";
+import type { AvailabilityProbe } from "../probe/availability.ts";
 
 export interface DecisionInput {
   features: TaskFeatures;
@@ -19,6 +22,8 @@ export interface DecisionInput {
   availableModels: Set<string>;
   cacheManager?: CacheManager;
   learning?: LearningManager;
+  selfLearn?: SelfLearnManager;
+  probe?: AvailabilityProbe;
   sessionId?: string;
   promptText?: string;
 }
@@ -68,7 +73,7 @@ function estimateChurn(
 }
 
 export function decide(input: DecisionInput): RouteDecision {
-  const { features, config, compiledRules, cooldowns, availableModels, cacheManager, learning, sessionId, promptText } = input;
+  const { features, config, compiledRules, cooldowns, availableModels, cacheManager, learning, selfLearn, probe, sessionId, promptText } = input;
   const now = Date.now();
   const prompt = promptText ?? features.promptText ?? "";
   const sid = sessionId ?? "";
@@ -132,6 +137,24 @@ export function decide(input: DecisionInput): RouteDecision {
       return { selector: alt, reason: `rule "${matched.id}" model "${desired}" unavailable → fallback "${alt}"`, ruleId: matched.id, source: "cooldown-avoid", timestamp: now };
     }
     return { selector: undefined, reason: `rule "${matched.id}" model "${desired}" unavailable`, ruleId: matched.id, source: "rule", timestamp: now };
+  }
+
+  // 2.5 self-learn 自适应（场景×难度）—— 无规则命中时，用学到的"最适合模型"
+  if (selfLearn && config.selfLearn.enabled && config.difficulty.enabled) {
+    const { difficulty, scenario } = analyzeTask(features, config.difficulty.lowThreshold, config.difficulty.highThreshold);
+    const learned = selfLearn.best(scenario, difficulty);
+    if (learned && isAvailable(learned, availableModels) && !cooldowns.isCooldown(learned)) {
+      const probeOk = probe ? probe.getAvailability(learned) !== "unavailable" : true;
+      if (probeOk) {
+        // churn：若切走丢缓存超阈值，倾向保持
+        if (shouldKeepForChurn(learned) && current) {
+          const loss = estimateChurn(current, learned, cacheManager, sid, prompt);
+          return { selector: current, reason: `selfLearn→${learned} but churn≈${loss}tok; keep ${current}`, ruleId: undefined, source: "keep", timestamp: now };
+        }
+        return { selector: learned, reason: `selfLearn[${scenario}/${difficulty}] → ${learned}${churnNote(learned)}`, ruleId: undefined, source: "default", timestamp: now };
+      }
+    }
+    // 无 self-learn 命中时，低/中难度默认回落到便宜模型（fallback 链兜底在步骤 6）
   }
 
   // 3. 学习偏好（learn）—— 在粘滞之前，minSamples 门槛

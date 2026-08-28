@@ -38,6 +38,9 @@ export function deepMerge(base: RouterConfig, override: RouterConfig): RouterCon
   if (override.cache) out.cache = { ...(base.cache as object ?? {}), ...(override.cache as object) } as RouterConfig["cache"];
   if (override.learn) out.learn = { ...(base.learn as object ?? {}), ...(override.learn as object) } as RouterConfig["learn"];
   if (override.churn) out.churn = { ...(base.churn as object ?? {}), ...(override.churn as object) } as RouterConfig["churn"];
+  if (override.difficulty) out.difficulty = { ...(base.difficulty as object ?? {}), ...(override.difficulty as object) } as RouterConfig["difficulty"];
+  if (override.selfLearn) out.selfLearn = { ...(base.selfLearn as object ?? {}), ...(override.selfLearn as object) } as RouterConfig["selfLearn"];
+  if (override.probe) out.probe = { ...(base.probe as object ?? {}), ...(override.probe as object) } as RouterConfig["probe"];
   return out;
 }
 
@@ -59,6 +62,19 @@ export function normalizeConfig(raw: RouterConfig | undefined): NormalizedRouter
   const learnCostW = Number.isFinite(r.learn?.costWeight as number) ? (r.learn!.costWeight as number) : -0.0001;
   const churnEnabled = r.churn?.enabled !== false;
   const churnMax = Number.isFinite(r.churn?.maxChurnTokens as number) ? Math.max(0, Math.trunc(r.churn!.maxChurnTokens as number)) : 8000;
+  const diffEnabled = r.difficulty?.enabled !== false;
+  const diffLow = Number.isFinite(r.difficulty?.lowThreshold as number) ? Math.max(0, r.difficulty!.lowThreshold as number) : 40;
+  const diffHigh = Number.isFinite(r.difficulty?.highThreshold as number) ? Math.max(diffLow + 1, r.difficulty!.highThreshold as number) : 120;
+  const slEnabled = r.selfLearn?.enabled !== false;
+  const slMin = Number.isFinite(r.selfLearn?.minSamples as number) ? Math.max(1, Math.trunc(r.selfLearn!.minSamples as number)) : 3;
+  const slDecay = Number.isFinite(r.selfLearn?.decay as number) ? Math.min(1, Math.max(0.1, r.selfLearn!.decay as number)) : 0.9;
+  const slSW = Number.isFinite(r.selfLearn?.successWeight as number) ? (r.selfLearn!.successWeight as number) : 1.0;
+  const slFW = Number.isFinite(r.selfLearn?.failureWeight as number) ? (r.selfLearn!.failureWeight as number) : -2.0;
+  const slCostW = Number.isFinite(r.selfLearn?.costWeight as number) ? (r.selfLearn!.costWeight as number) : -0.0001;
+  const probeEnabled = r.probe?.enabled !== false;
+  const probeTimeout = Number.isFinite(r.probe?.timeoutMs as number) ? Math.max(1000, Math.trunc(r.probe!.timeoutMs as number)) : 300000;
+  const probeOnStart = r.probe?.probeOnStart !== false;
+  const probeExclude = r.probe?.excludeUnavailable !== false;
   return {
     enabled: r.enabled !== false,
     defaultModel: typeof r.defaultModel === "string" ? r.defaultModel.trim() || undefined : undefined,
@@ -74,6 +90,10 @@ export function normalizeConfig(raw: RouterConfig | undefined): NormalizedRouter
     cache: { enabled: cacheEnabled, preferCache, minHitChars, sticky, stickyTtlMs },
     learn: { enabled: learnEnabled, windowSize: learnWindow, minSamples: learnMinSamples, successWeight: learnSW, failureWeight: learnFW, cacheWeight: learnCW, costWeight: learnCostW },
     churn: { enabled: churnEnabled, maxChurnTokens: churnMax },
+    catalogPath: typeof r.catalogPath === "string" && r.catalogPath.trim() ? r.catalogPath.trim() : join(homedir(), ".pi/agent/pi-router-catalog.json"),
+    difficulty: { enabled: diffEnabled, lowThreshold: diffLow, highThreshold: diffHigh },
+    selfLearn: { enabled: slEnabled, minSamples: slMin, decay: slDecay, successWeight: slSW, failureWeight: slFW, costWeight: slCostW },
+    probe: { enabled: probeEnabled, timeoutMs: probeTimeout, probeOnStart, excludeUnavailable: probeExclude },
   };
 }
 

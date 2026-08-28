@@ -10,6 +10,8 @@ import type { CompiledRule } from "../engine/rules.ts";
 import type { CooldownSet } from "../engine/registry.ts";
 import type { CacheManager } from "../engine/cache.ts";
 import type { LearningManager } from "../engine/learn.ts";
+import type { SelfLearnManager } from "../engine/selflearn.ts";
+import type { AvailabilityProbe } from "../probe/availability.ts";
 
 export interface TurnHookDeps {
   config: NormalizedRouterConfig;
@@ -17,6 +19,8 @@ export interface TurnHookDeps {
   cooldowns: CooldownSet;
   cacheManager?: CacheManager;
   learning?: LearningManager;
+  selfLearn?: SelfLearnManager;
+  probe?: AvailabilityProbe;
   sessionId?: string;
   pushDecision(record: DecisionRecord): void;
   setStatus(text: string): void;
@@ -70,6 +74,8 @@ export function resolveTurnDecision(input: TurnHookInput): DecisionRecord | unde
     availableModels: input.availableModels,
     cacheManager: deps.cacheManager,
     learning: deps.learning,
+    selfLearn: deps.selfLearn,
+    probe: deps.probe,
     sessionId: deps.sessionId,
     promptText: features.promptText,
   });

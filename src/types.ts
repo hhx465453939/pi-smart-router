@@ -133,6 +133,91 @@ export interface LearnScore {
   samples: number;
 }
 
+/** 任务难度 */
+export type Difficulty = "low" | "medium" | "high";
+
+/** 任务场景 */
+export type Scenario = "frontend" | "backend" | "test" | "ops" | "research" | "general" | "document";
+
+/** 模型目录条目 */
+export interface ModelCatalogEntry {
+  selector: string;
+  provider: string;
+  contextWindow?: number;
+  cost?: { input: number; output: number; cacheRead: number };
+  input?: string[];
+  scenarios: Scenario[];
+  difficultyTier?: Difficulty;
+  note?: string;
+  learnScore: Record<string, number>;
+  samples: Record<string, number>;
+  lastSeen?: number;
+}
+
+/** 可用性快照 */
+export type Availability = "available" | "unavailable" | "uncertain";
+
+export interface ProbeSnapshot {
+  [selector: string]: Availability;
+}
+
+/** handoff 事件 */
+export interface HandoffEvent {
+  from: string;
+  to: string;
+  scenario: Scenario;
+  difficulty: Difficulty;
+  reason: string;
+  ts: number;
+}
+
+/** 难度配置 */
+export interface DifficultyConfig {
+  enabled?: boolean;
+  lowThreshold?: number;
+  highThreshold?: number;
+}
+
+export interface NormalizedDifficultyConfig {
+  enabled: boolean;
+  lowThreshold: number;
+  highThreshold: number;
+}
+
+/** self-learn 配置 */
+export interface SelfLearnConfig {
+  enabled?: boolean;
+  minSamples?: number;
+  decay?: number;
+  successWeight?: number;
+  failureWeight?: number;
+  costWeight?: number;
+}
+
+export interface NormalizedSelfLearnConfig {
+  enabled: boolean;
+  minSamples: number;
+  decay: number;
+  successWeight: number;
+  failureWeight: number;
+  costWeight: number;
+}
+
+/** probe 配置 */
+export interface ProbeConfig {
+  enabled?: boolean;
+  timeoutMs?: number;
+  probeOnStart?: boolean;
+  excludeUnavailable?: boolean;
+}
+
+export interface NormalizedProbeConfig {
+  enabled: boolean;
+  timeoutMs: number;
+  probeOnStart: boolean;
+  excludeUnavailable: boolean;
+}
+
 /** 路由规则 */
 export interface RouterRule {
   id: string;
@@ -203,6 +288,10 @@ export interface RouterConfig {
   cache?: CacheConfig;
   learn?: LearnConfig;
   churn?: ChurnConfig;
+  catalogPath?: string;
+  difficulty?: DifficultyConfig;
+  selfLearn?: SelfLearnConfig;
+  probe?: ProbeConfig;
   enabled?: boolean;
   defaultModel?: string;
   /** turn | request | both */
@@ -224,6 +313,10 @@ export interface NormalizedRouterConfig {
   cache: NormalizedCacheConfig;
   learn: NormalizedLearnConfig;
   churn: NormalizedChurnConfig;
+  catalogPath: string;
+  difficulty: NormalizedDifficultyConfig;
+  selfLearn: NormalizedSelfLearnConfig;
+  probe: NormalizedProbeConfig;
   enabled: boolean;
   defaultModel: string | undefined;
   routingLevel: "turn" | "request" | "both";

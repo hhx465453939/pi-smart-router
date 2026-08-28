@@ -30,6 +30,19 @@ pi 通过 `sessionId` 前缀缓存（Anthropic `cache_control` / OpenAI `prompt_
 
 详见 `tasks/CHG-002/SPEC.md` 的 ADR-006 / ADR-007 / ADR-008。
 
+### v0.3.0：全自动无缝智能路由
+
+> **把决定权交给模型，越用越智能。**
+
+- **难度感知**：prompt 特征 → 低/中/高难度。低中难度默认便宜快模型拓荒（dsv4-flash），高难度攻坚走强模型，不为简单任务烧 k3/codex
+- **场景识别**：自动识别 前端/后端/测试/运维/研究/文档 场景，配合 catalog 档案匹配
+- **模型能力快照（catalog）**：`~/.pi/agent/pi-router-catalog.json` 自动合并 modelRegistry（窗口/成本/输入类型）+ 场景标注 + self-learn 得分，持久化可编辑
+- **self-learn 多维评分**：按 `场景×难度` 维度记录每个模型的真实表现（成败/成本/handoff 方向），跨会话收敛到"前端→k3、测试→codex、一般→flash"，**无需写死规则**
+- **可用性探测（三层）**：① 无 key 模型立即排除；② 启动后台异步连通性探测（不阻塞聊天，timeout 5 分钟）；③ 真实调用捕获 401/402/403（套餐失效/欠费）→ 本 session 确定性排除
+- **router_handoff 工具**：当前模型可主动把工作交接给更适合的模型（`router_handoff(target, reason, summary)`），上下文/缓存无缝保留，交接结果喂 self-learn
+
+详见 `tasks/CHG-003/SPEC.md` 的 ADR-009~013。
+
 ## 为什么
 
 pi 自带的模型切换是手动的（`/model`、`Ctrl+P`）。当你配置了多个模型（coding / 通用 / 多模态 / 长上下文）时，需要一个智能调度层自动选择。
@@ -194,6 +207,9 @@ cp examples/pi-router.cn.json ~/.pi/agent/pi-router.json
 /router rules           — 已编译规则列表
 /router cache           — 每模型缓存命中统计
 /router learn           — 每 taskType 学习得分
+/router catalog         — 模型能力快照 + self-learn 得分
+/router probe           — 本 session 可用性探测快照
+/router handoff         — 最近交接事件
 /router reload          — 从 pi-router.json 热加载配置
 /router clear [model]   — 清除指定模型或全部冷却
 /router clear-cache     — 清除缓存记录
@@ -251,7 +267,7 @@ src/
 ## 开发
 
 ```bash
-npm test        # node --test（引擎单测，77 tests，含 cache/learn/churn）
+npm test        # node --test（引擎单测，108 tests，含 cache/learn/churn/catalog/difficulty/selflearn/probe）
 npm run typecheck  # tsc --noEmit
 ```
 

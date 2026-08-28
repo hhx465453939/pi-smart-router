@@ -1,6 +1,6 @@
 {
   "enabled": true,
-  "defaultModel": "zai-coding-cn/glm-5.3",
+  "defaultModel": "volces/deepseek-v4-flash[1m]",
   "routingLevel": "turn",
   "cooldownMs": 60000,
   "failure": {
@@ -36,6 +36,25 @@
     "enabled": true,
     "maxChurnTokens": 8000
   },
+  "difficulty": {
+    "enabled": true,
+    "lowThreshold": 40,
+    "highThreshold": 120
+  },
+  "selfLearn": {
+    "enabled": true,
+    "minSamples": 3,
+    "decay": 0.9,
+    "successWeight": 1.0,
+    "failureWeight": -2.0,
+    "costWeight": -0.0001
+  },
+  "probe": {
+    "enabled": true,
+    "timeoutMs": 300000,
+    "probeOnStart": true,
+    "excludeUnavailable": true
+  },
   "taskTypeRules": {
     "code": ["implement", "fix", "bug", "refactor", "function", "api", "test", "type", "error", "compile", "stack", "trace", "deploy", "migrate"],
     "document": ["document", "readme", "doc", "explain", "summarize", "write", "draft", "proposal", "report"],
@@ -43,19 +62,43 @@
   },
   "rules": [
     {
-      "id": "code-task",
-      "name": "编码任务用推理强模型",
-      "priority": 100,
-      "when": { "taskType": "code" },
-      "model": "opencode-go/kimi-k3",
+      "id": "frontend-task",
+      "name": "前端任务用 k3-256k",
+      "priority": 110,
+      "when": { "prompt": { "contains": "react" } },
+      "model": "kimi-coding/k3-256k",
       "cacheAware": true
     },
     {
-      "id": "long-context",
-      "name": "长上下文用 256k 窗口",
-      "priority": 90,
-      "when": { "contextTokens": { "gt": 80000 } },
-      "model": "kimi-coding/k3-256k"
+      "id": "frontend-task-vue",
+      "name": "前端任务用 k3-256k",
+      "priority": 109,
+      "when": { "prompt": { "contains": "vue" } },
+      "model": "kimi-coding/k3-256k",
+      "cacheAware": true
+    },
+    {
+      "id": "frontend-task-cn",
+      "name": "前端任务用 k3-256k",
+      "priority": 108,
+      "when": { "prompt": { "contains": "前端" } },
+      "model": "kimi-coding/k3-256k",
+      "cacheAware": true
+    },
+    {
+      "id": "ops-debug",
+      "name": "运维/debug 推 codex",
+      "priority": 105,
+      "when": { "taskType": "code", "prompt": { "contains": "debug" } },
+      "model": "openai-codex/gpt-5.3-codex-spark"
+    },
+    {
+      "id": "complex-backend",
+      "name": "复杂后端逻辑用 glm-5.3",
+      "priority": 100,
+      "when": { "taskType": "code" },
+      "model": "zai-coding-cn/glm-5.3",
+      "cacheAware": true
     },
     {
       "id": "image-task",
@@ -65,26 +108,19 @@
       "model": "opencode-go/deepseek-v4-flash-vision-exp"
     },
     {
-      "id": "fast-task",
-      "name": "分析/研究用低成本快速模型",
-      "priority": 50,
-      "when": { "taskType": { "in": ["research", "analysis"] } },
-      "model": "opencode-go/glm-5.3-flash"
-    },
-    {
-      "id": "later-turns",
-      "name": "多轮后切稳态模型",
-      "priority": 10,
-      "when": { "turnIndex": { "gte": 6 } },
-      "model": "zai-coding-cn/glm-5.3"
+      "id": "long-context",
+      "name": "长上下文用大窗口",
+      "priority": 90,
+      "when": { "contextTokens": { "gt": 100000 } },
+      "model": "kimi-coding/k3-256k"
     }
   ],
   "fallback": {
     "mode": "model-chain",
     "models": [
+      "volces/deepseek-v4-flash[1m]",
       "zai-coding-cn/glm-5.3",
       "opencode-go/deepseek-v4-pro",
-      "shudie/DeepSeek-V4-Pro",
       "zai-coding-cn/glm-5.3-flash"
     ]
   },

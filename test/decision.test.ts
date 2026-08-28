@@ -38,6 +38,10 @@ function cfg(overrides: Partial<NormalizedRouterConfig> = {}): NormalizedRouterC
     cache: { enabled: true, preferCache: true, minHitChars: 1024, sticky: true, stickyTtlMs: 300000 },
     learn: { enabled: false, windowSize: 50, minSamples: 2, successWeight: 1.0, failureWeight: -2.0, cacheWeight: 0.0005, costWeight: -0.0001 },
     churn: { enabled: false, maxChurnTokens: 8000 },
+    catalogPath: "/tmp/pi-router-catalog-test.json",
+    difficulty: { enabled: false, lowThreshold: 40, highThreshold: 120 },
+    selfLearn: { enabled: false, minSamples: 3, decay: 0.9, successWeight: 1.0, failureWeight: -2.0, costWeight: -0.0001 },
+    probe: { enabled: false, timeoutMs: 300000, probeOnStart: false, excludeUnavailable: true },
     ...overrides,
   };
 }
