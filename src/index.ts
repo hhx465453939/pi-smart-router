@@ -118,6 +118,74 @@ export default function (pi: ExtensionAPI) {
     } catch { return undefined; }
   }
 
+  // 无痛切换：按当前场景/难度 rank 逐个试下一个可用模型，直至成功
+  const recentFallbackTries = new Map<string, number>();
+  async function tryImmediateFallback(failedSelector: string, ctx: ExtensionContext, reason: string): Promise<boolean> {
+    const cfg = watcher?.get() ?? loadConfig(ctx.cwd);
+    const available = availableSelectors(ctx);
+    const filtered = probe ? new Set(probe.filterAvailable([...available])) : available;
+    // 已排除失败者，候选为 filtered 中未冷却的
+    const candidates = [...filtered].filter((s) => !cooldowns.isCooldown(s));
+    if (candidates.length === 0) {
+      ctx.ui.notify(`router: 无可用模型可 fallback（${failedSelector} 失败: ${reason}）`, "error");
+      return false;
+    }
+    // 按当前场景/难度 rank 排序候选
+    let ranked = candidates;
+    if (cfg.difficulty.enabled && profiles.length) {
+      const { difficulty } = analyzeTask(
+        { taskType: lastTaskType as never, toolNames: [], contextTokens: contextTokens(ctx), messageCount: messageCount(ctx), turnIndex, promptLength: lastPromptText.length, hasImage: false, explicitModel: undefined, currentModel: failedSelector, thinkingLevel: undefined, promptText: lastPromptText },
+        cfg.difficulty.lowThreshold,
+        cfg.difficulty.highThreshold,
+      );
+      const scenario = (() => { try { return analyzeTask({ taskType: lastTaskType as never, toolNames: [], contextTokens: undefined, messageCount: 0, turnIndex, promptLength: 0, hasImage: false, explicitModel: undefined, currentModel: failedSelector, thinkingLevel: undefined, promptText: lastPromptText }, cfg.difficulty.lowThreshold, cfg.difficulty.highThreshold).scenario; } catch { return "general" as const; } })();
+      ranked = rankModels(
+        profiles.filter((p) => candidates.includes(p.selector)),
+        difficulty,
+        (sel) => catalog?.get(sel)?.learnScore[`${scenario}×${difficulty}`] ?? 0,
+      ).map((p) => p.selector);
+      // 若 rank 为空，回退到原 candidates 顺序
+      if (ranked.length === 0) ranked = candidates;
+    }
+    // 防循环：同 prompt 短时间内最多 3 次
+    const promptHash = `${lastPromptText.slice(0, 200)}::${failedSelector}`;
+    const tries = recentFallbackTries.get(promptHash) ?? 0;
+    if (tries >= 3) {
+      ctx.ui.notify(`router: 已尝试 3 次仍失败，暂停自动切换`, "warning");
+      return false;
+    }
+    recentFallbackTries.set(promptHash, tries + 1);
+    setTimeout(() => recentFallbackTries.delete(promptHash), 60_000);
+    const next = ranked.find((s) => s.toLowerCase() !== failedSelector.toLowerCase());
+    if (!next) {
+      ctx.ui.notify(`router: 无其他可用模型可切（${failedSelector} 已排除）`, "warning");
+      return false;
+    }
+    // 切换模型并静默重试本轮 prompt
+    try {
+      const reg = (ctx as unknown as { modelRegistry?: { find?: (p: string, id: string) => unknown } }).modelRegistry;
+      const [provider, ...rest] = next.split("/");
+      const modelId = rest.join("/");
+      const modelObj = reg?.find?.(provider, modelId);
+      if (!modelObj) {
+        ctx.ui.notify(`router: 目标模型未找到 ${next}`, "warning");
+        return false;
+      }
+      const ok = await pi.setModel(modelObj as never);
+      if (!ok) {
+        ctx.ui.notify(`router: 切换到 ${next} 失败（无权限）`, "warning");
+        return false;
+      }
+      ctx.ui.notify(`⚡ router: ${failedSelector} 不可用 → 已秒切 ${next} 并重试`, "info");
+      // 静默重试：用 followUp 触发新 turn，重试原始 prompt
+      try { pi.sendUserMessage(lastPromptText, { deliverAs: "followUp" } as never); } catch { /* ignore */ }
+      return true;
+    } catch (e) {
+      ctx.ui.notify(`router: 切换失败 ${String(e).slice(0, 100)}`, "error");
+      return false;
+    }
+  }
+
   /** auto-profiling：遍历全部已注册模型，生成画像（含未在 available 的） */
   /** 读取 pi models-store.json 作为真实 cost 补充源（运行时快照可能缺 cost） */
   function storeCosts(): Map<string, { input: number; output: number; cacheRead: number }> {
@@ -413,12 +481,13 @@ export default function (pi: ExtensionAPI) {
         try { pi.appendEntry(LEARN_ENTRY, { taskType, selector: sel, success: false, timestamp: Date.now() } as never); } catch { /* ignore */ }
       }
     }
-    // 可用性：401/402/403 → 套餐失效/欠费，标记本 session 不可用
+    // 可用性：401/402/403 → 套餐失效/欠费，标记本 session 不可用 + 无痛秒切
     if (cfg.probe.enabled && (event.status === 401 || event.status === 402 || event.status === 403)) {
       const sel = currentSelector(ctx);
       if (sel && probe) {
         probe.markAuthFailure(sel);
         ctx.ui.notify(`⚡ router: ${sel} auth failed (HTTP ${event.status}) — excluded this session`, "warning");
+        void tryImmediateFallback(sel, ctx, `HTTP ${event.status}`);
       }
     }
     // self-learn 失败记录
@@ -507,6 +576,7 @@ export default function (pi: ExtensionAPI) {
     if (isQuotaExceeded(contentText) && sel && probe) {
       probe.markAuthFailure(sel);
       ctx.ui.notify(`⚡ router: "${sel}" quota exceeded — excluded from rank until next session`, "error");
+      void tryImmediateFallback(sel, ctx, "quota exceeded");
     }
     onToolResult(
       { isError: (event as unknown as { isError?: boolean }).isError, content: (event as unknown as { content?: unknown }).content },
