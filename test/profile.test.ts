@@ -23,9 +23,22 @@ describe("profileModel auto-profiling", () => {
     assert.equal(p.capabilityTier, "high");
   });
 
-  it("luna (low-cost but capable) → medium/medium-or-high", () => {
+  it("luna (low-cost but capable) → medium/medium", () => {
     const p = profileModel(reg({ provider: "openai-codex", id: "gpt-5.6-luna", cost: { input: 1.5, output: 8, cacheRead: 0.15 }, contextWindow: 128000, reasoning: true }));
     assert.equal(p.priceTier, "medium");
+    assert.equal(p.capabilityTier, "medium");
+  });
+
+  it("glm-5.3 (flagship) → high", () => {
+    const p = profileModel(reg({ id: "glm-5.3", cost: { input: 1.4, output: 0, cacheRead: 0 }, contextWindow: 1000000, reasoning: true }));
+    assert.equal(p.capabilityTier, "high");
+  });
+
+  it("mimo-v2.5 mid-range → medium; qwen3.7-max flagship → high", () => {
+    const mid = profileModel(reg({ id: "mimo-v2.5", cost: { input: 0.14, output: 0.28, cacheRead: 0 }, contextWindow: 1000000, reasoning: true }));
+    assert.equal(mid.capabilityTier, "medium");
+    const flag = profileModel(reg({ id: "qwen3.7-max", cost: { input: 2.5, output: 0, cacheRead: 0 }, contextWindow: 1000000, reasoning: true }));
+    assert.equal(flag.capabilityTier, "high");
   });
 
   it("vision model detection", () => {
