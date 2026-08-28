@@ -84,6 +84,37 @@ pi -e ./src/index.ts
 /router status
 ```
 
+## 快速开始（从部署到使用）
+
+```bash
+# 1. 安装（已推送到 GitHub，直接全局安装）
+pi install git:github.com/hhx465453939/pi-smart-router
+pi list  # 确认出现 git:github.com/hhx465453939/pi-smart-router
+
+# 2. 一键部署中文模板（开箱即用）
+cp examples/pi-router.cn.json ~/.pi/agent/pi-router.json
+# 或手动编辑 ~/.pi/agent/pi-router.json 按需改规则
+
+# 3. 重启 pi（或热重载）
+# 重启 pi 后自动加载；或在 pi 内执行：
+/router reload
+
+# 4. 查看状态
+/router status   # 总览：开关/当前模型/规则/冷却/缓存/学习
+/router rules    # 已编译规则
+/router value    # 全量模型性价比排名（自动画像）
+/router help     # 完整命令帮助
+
+# 5. 日常使用
+# 正常聊天即可，路由按规则/自适应学习自动切模型
+# 需要强制指定：@model:openai/gpt-5.1 帮我分析这段日志
+# 需要手动控制：/router off  （关闭路由，手动选模型）  /router on  （重新开启）
+# 需要排查：/router cache  /router learn  /router probe  /router handoff
+```
+
+> **开关说明**：`/router toggle` / `on` / `off` 均已持久化到 `pi-router.json`，重启后仍生效。
+> **额度耗尽**：遇到 `AccountQuotaExceeded`（429 月度额度耗尽）会自动从本 session 的 rank 排除，无需手动处理，重置后下次会话自动恢复。
+
 ## 配置
 
 配置文件为 `pi-router.json`，支持分层：
@@ -259,7 +290,9 @@ cp examples/pi-router.cn.json ~/.pi/agent/pi-router.json
 /router clear-cache     — 清除缓存记录
 /router clear-learn     — 清除学习状态
 /router clear-history   — 清除决策历史
-/router toggle          — 启用/禁用（内存）
+/router toggle          — 切换开/关（持久化到 pi-router.json）
+/router on / enable     — 开启路由（持久化）
+/router off / disable   — 关闭路由（持久化，手动选模型）
 /router test <prompt>   — 干跑：对给定 prompt 做路由决策但不切模型
 /router help            — 帮助
 ```

@@ -2,8 +2,8 @@
  * 配置加载：全局 ~/.pi/agent/pi-router.json + 项目级 .pi/pi-router.json（项目覆盖全局）
  * 含归一化、热加载（tick 探针）、错误模式编译。
  */
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import type { NormalizedRouterConfig, RouterConfig } from "./types.ts";
 import { compileErrorPatterns } from "./engine/failure.ts";
@@ -81,7 +81,7 @@ export function normalizeConfig(raw: RouterConfig | undefined): NormalizedRouter
     routingLevel,
     cooldownMs,
     cooldownOnStatus: Array.isArray(r.failure?.cooldownOnStatus) ? (r.failure!.cooldownOnStatus as number[]).filter((n) => Number.isFinite(n)) : [429, 500, 502, 503, 504],
-    cooldownOnToolErrorPatterns: compileErrorPatterns(r.failure?.cooldownOnToolErrorPatterns ?? ["rate.?limit", "context.?length", "overloaded", "too.?many.?requests", "service.?unavailable", "timeout"]),
+    cooldownOnToolErrorPatterns: compileErrorPatterns(r.failure?.cooldownOnToolErrorPatterns ?? ["rate.?limit", "context.?length", "overloaded", "too.?many.?requests", "service.?unavailable", "timeout", "AccountQuotaExceeded", "quota.*exceeded", "exceeded.*quota", "insufficient.*quota", "monthly.*quota"]),
     taskTypeRules: r.taskTypeRules ?? {},
     rules: Array.isArray(r.rules) ? (r.rules as NormalizedRouterConfig["rules"]) : [],
     fallback: r.fallback ?? { mode: "off" as const },
@@ -121,4 +121,20 @@ export function createConfigWatcher(cwd: string): ConfigWatcher {
     get() { return cached; },
     reload() { cached = loadConfig(cwd); return cached; },
   };
+}
+
+/** 持久化 enabled 开关（写入全局配置，若存在项目配置则优先写项目） */
+export function persistEnabled(cwd: string, enabled: boolean): void {
+  const projectPath = projectConfigPath(cwd);
+  const globalPath = globalConfigPath();
+  const targetPath = existsSync(projectPath) ? projectPath : globalPath;
+  let raw: Record<string, unknown> = {};
+  if (existsSync(targetPath)) {
+    try { raw = JSON.parse(readFileSync(targetPath, "utf8")) as Record<string, unknown>; } catch { raw = {}; }
+  }
+  raw.enabled = enabled;
+  try {
+    mkdirSync(dirname(targetPath), { recursive: true });
+    writeFileSync(targetPath, JSON.stringify(raw, null, 2) + "\n", "utf8");
+  } catch { /* 忽略写入失败 */ }
 }

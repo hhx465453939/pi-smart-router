@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { classifyStatus, classifyRouteFailure, compileErrorPatterns, matchesToolErrorPatterns } from "../src/engine/failure.ts";
+import { isQuotaExceeded } from "../src/hooks/failure.ts";
 
 describe("classifyStatus", () => {
   it("rate-limit", () => assert.equal(classifyStatus(429), "rate-limit"));
@@ -23,6 +24,19 @@ describe("classifyRouteFailure", () => {
   it("off: never fallback (except rate-limit etc) — off behaves like retry for shouldFallback contract", () => {
     // In spec, off still uses retry semantics; actual planner will produce single attempt anyway
     assert.equal(classifyRouteFailure(400, "off").shouldFallback, false);
+  });
+});
+
+describe("isQuotaExceeded", () => {
+  it("detects AccountQuotaExceeded", () => {
+    assert.equal(isQuotaExceeded('429 {"error":{"code":"AccountQuotaExceeded","message":"You have exceeded the monthly usage quota."}}'), true);
+    assert.equal(isQuotaExceeded("quota exceeded"), true);
+    assert.equal(isQuotaExceeded("Monthly quota exceeded"), true);
+    assert.equal(isQuotaExceeded("hello world"), false);
+  });
+  it("quota patterns in default config", () => {
+    const pats = compileErrorPatterns(["AccountQuotaExceeded", "quota.*exceeded"]);
+    assert.equal(matchesToolErrorPatterns('AccountQuotaExceeded: quota exceeded', pats), true);
   });
 });
 

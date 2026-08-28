@@ -8,14 +8,14 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { DecisionRecord, NormalizedRouterConfig } from "./types.ts";
-import { loadConfig, createConfigWatcher, type ConfigWatcher } from "./config.ts";
+import { loadConfig, createConfigWatcher, persistEnabled, type ConfigWatcher } from "./config.ts";
 import { CooldownSet } from "./engine/registry.ts";
 import { CacheManager } from "./engine/cache.ts";
 import { LearningManager } from "./engine/learn.ts";
 import { compileRules, type CompiledRule } from "./engine/rules.ts";
 import { resolveTurnDecision } from "./hooks/agent.ts";
 import { resolveProviderDecision } from "./hooks/provider.ts";
-import { onProviderResponse, onToolResult } from "./hooks/failure.ts";
+import { onProviderResponse, onToolResult, isQuotaExceeded } from "./hooks/failure.ts";
 import { formatRules, formatStatus } from "./commands/router.ts";
 import { buildRouterTool } from "./tool/router.ts";
 import { classifyTaskType } from "./context/task.ts";
@@ -488,10 +488,26 @@ export default function (pi: ExtensionAPI) {
     try { cacheManager.invalidatePrefix(); } catch { /* ignore */ }
   });
 
-  // ——— tool_result: 工具错误冷却 + 学习失败记录 ———
+  // ——— tool_result: 工具错误冷却 + 学习失败记录 + 额度耗尽排除 ———
   pi.on("tool_result", async (event, ctx) => {
     const cfg = watcher?.get() ?? loadConfig(ctx.cwd);
     const sel = currentSelector(ctx);
+    // 额度耗尽（AccountQuotaExceeded）需要立即从 rank 排除，避免 60s 后重试死循环
+    const contentText = (() => {
+      const c = (event as unknown as { content?: unknown }).content;
+      if (typeof c === "string") return c;
+      if (Array.isArray(c)) return (c as Array<Record<string, unknown>>).map((p) => typeof p.text === "string" ? p.text : "").join("\n");
+      if (c && typeof c === "object") {
+        const o = c as Record<string, unknown>;
+        if (typeof o.text === "string") return o.text;
+        if (typeof o.message === "string") return o.message;
+      }
+      return "";
+    })();
+    if (isQuotaExceeded(contentText) && sel && probe) {
+      probe.markAuthFailure(sel);
+      ctx.ui.notify(`⚡ router: "${sel}" quota exceeded — excluded from rank until next session`, "error");
+    }
     onToolResult(
       { isError: (event as unknown as { isError?: boolean }).isError, content: (event as unknown as { content?: unknown }).content },
       {
@@ -656,10 +672,32 @@ export default function (pi: ExtensionAPI) {
       if (cmd === "toggle") {
         const cfg = deps.getConfig();
         const next = !cfg.enabled;
+        try { persistEnabled(ctx.cwd, next); } catch { /* ignore */ }
+        // 同步内存状态
         const rawCfg = watcher?.get();
         if (rawCfg) (rawCfg as unknown as Record<string, unknown>).enabled = next;
-        ctx.ui.notify(`router ${next ? "enabled" : "disabled"} (memory only — edit pi-router.json to persist)`, "info");
-        ctx.ui.setStatus("router", next ? `⚡ ${deps.getCurrentModel() ?? ""}` : "⏸ router off");
+        // 立即重载以同步 watcher
+        try { watcher?.reload(); } catch { /* ignore */ }
+        ctx.ui.notify(`router ${next ? "✅ enabled" : "⏸️ disabled"} (已持久化到 pi-router.json)`, next ? "info" : "warning");
+        ctx.ui.setStatus("router", next ? `⚡ ${deps.getCurrentModel() ?? ""} (router on)` : "⏸ router off — 手动模式");
+        return;
+      }
+      if (cmd === "on" || cmd === "enable") {
+        try { persistEnabled(ctx.cwd, true); } catch { /* ignore */ }
+        const rawCfg = watcher?.get();
+        if (rawCfg) (rawCfg as unknown as Record<string, unknown>).enabled = true;
+        try { watcher?.reload(); } catch { /* ignore */ }
+        ctx.ui.notify("router ✅ enabled (已持久化)", "info");
+        ctx.ui.setStatus("router", `⚡ ${deps.getCurrentModel() ?? ""} (router on)`);
+        return;
+      }
+      if (cmd === "off" || cmd === "disable") {
+        try { persistEnabled(ctx.cwd, false); } catch { /* ignore */ }
+        const rawCfg = watcher?.get();
+        if (rawCfg) (rawCfg as unknown as Record<string, unknown>).enabled = false;
+        try { watcher?.reload(); } catch { /* ignore */ }
+        ctx.ui.notify("router ⏸️ disabled — 手动模式 (已持久化)", "warning");
+        ctx.ui.setStatus("router", "⏸ router off — 手动模式");
         return;
       }
       if (cmd === "test") {
@@ -698,23 +736,36 @@ export default function (pi: ExtensionAPI) {
       }
       if (cmd === "help" || cmd === "h") {
         ctx.ui.notify([
-          "/router [subcommand]",
-          "  status (default) — current model / rules / cooldowns / cache / learn / recent decisions",
-          "  rules            — list compiled rules",
-          "  cache            — show per-model cache hit stats",
-          "  learn            — show per-taskType learned model scores",
-          "  catalog          — show model catalog + self-learn scores",
-          "  value [low|mid|high] — auto-profiled model value rank",
-          "  probe            — show availability snapshot",
-          "  handoff          — show recent handoff events",
-          "  reload           — reload config from pi-router.json",
-          "  clear [model]    — clear cooldown(s)",
-          "  clear-cache      — clear cache records",
-          "  clear-learn      — clear learned state",
-          "  clear-history    — clear decision history",
-          "  toggle           — enable/disable router (memory only)",
-          "  test <prompt>    — dry-run routing for a prompt",
-          "  help             — this help",
+          "pi-smart-router — 智能路由使用指南",
+          "",
+          "开关控制（持久化，重启后仍生效）：",
+          "  /router toggle          — 切换开/关（自动写入 pi-router.json）",
+          "  /router on / enable     — 开启路由",
+          "  /router off / disable   — 关闭路由（手动选模型，不自动切）",
+          "",
+          "查看状态：",
+          "  /router / status        — 总览：开关/当前模型/可用模型/规则/fallback/冷却/缓存/学习/最近决策",
+          "  /router rules           — 已编译规则（优先级/条件→模型）",
+          "  /router cache           — 每模型缓存命中（hit%/prefix/read/write）",
+          "  /router learn           — 每任务类型学习得分（taskType→model 分数）",
+          "  /router catalog         — 模型能力快照 + 自适应得分",
+          "  /router value [low|medium|high] — 全量模型性价比排名（自动画像）",
+          "  /router probe           — 本 session 可用性（连通性/套餐失效排除）",
+          "  /router handoff         — 最近模型交接事件",
+          "",
+          "维护操作：",
+          "  /router reload          — 热重载 pi-router.json（改配置后用）",
+          "  /router clear [model]   — 清除某模型或全部冷却",
+          "  /router clear-cache     — 清空缓存记录",
+          "  /router clear-learn     — 清空学习状态",
+          "  /router clear-history   — 清空决策历史",
+          "  /router test <prompt>   — 干跑：输入 prompt 看会路由到谁（不真切模型）",
+          "",
+          "配置：全局 ~/.pi/agent/pi-router.json  项目级 .pi/pi-router.json（覆盖全局）",
+          "  模板：examples/pi-router.cn.json（中文生态，开箱即用）",
+          "  额度耗尽（AccountQuotaExceeded 429）会自动从 rank 排除至下次会话",
+          "",
+          "示例：@model:openai/gpt-5.1 强制指定本次模型（绕过路由）",
         ].join("\n"), "info");
         return;
       }
