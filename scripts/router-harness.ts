@@ -239,6 +239,12 @@ async function main() {
   });
   console.log(`    current=${harness.getCurrentSelector()} (期望 opencode/deepseek-v4-flash)`);
 
+  console.log("\n[3b] message_end API 错误（真实链路：SDK 层 429 重试耗尽 → errorMessage 到达 message_end，after_provider_response 不触发）");
+  await harness.fire("message_end", {
+    message: { role: "assistant", stopReason: "error", errorMessage: 'Retry failed after 3 attempts: 429 {"error":{"code":"AccountQuotaExceeded","message":"You have exceeded the monthly usage quota. It will reset at 2026-09-06"}}', provider: "volces", model: "deepseek-v4-flash[1m]", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } },
+  });
+  console.log(`    after message_end-error: current=${harness.getCurrentSelector()} (期望非 volces)`);
+
   console.log("\n[5] 关键决策检查");
   const decisions = (before2 as any[]).map(r => ({ sel: r.selector, reason: r.reason, source: r.source, ruleId: r.ruleId }));
   console.log(`    decisions: ${JSON.stringify(decisions, null, 2)}`);

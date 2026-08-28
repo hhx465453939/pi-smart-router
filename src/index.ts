@@ -516,11 +516,32 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // ——— message_end: 回填缓存 usage（核心特色）+ 学习成功记录 ———
+  // ——— message_end: 回填缓存 usage（核心特色）+ 学习成功记录 + API 错误检测（真正可靠的 429/401 捕获点）———
+  // 根因：openai-completions 等 API 的 429 重试在 SDK 客户端层(retryProviderRequest)内部完成，
+  // 3 次都失败后 throw，onResponse/after_provider_response 根本不触发；
+  // 错误最终以 assistant message(stopReason=error, errorMessage) 的形式到达 message_end。
   pi.on("message_end", async (event, ctx) => {
     try {
-      const msg = (event as unknown as { message?: { role?: string; usage?: { cacheRead?: number; cacheWrite?: number; input?: number; output?: number; cost?: { total?: number } } } }).message;
-      if (!msg || msg.role !== "assistant" || !msg.usage) return;
+      const msg = (event as unknown as { message?: { role?: string; stopReason?: string; errorMessage?: string; provider?: string; model?: string; usage?: { cacheRead?: number; cacheWrite?: number; input?: number; output?: number; cost?: { total?: number } } } }).message;
+      if (!msg || msg.role !== "assistant") return;
+      // — API 错误检测：429 quota / 401/402/403 套餐失效 → 无痛秒切 —
+      if (msg.stopReason === "error" && msg.errorMessage) {
+        const errText = msg.errorMessage;
+        const cfg0 = watcher?.get() ?? loadConfig(ctx.cwd);
+        // 出错模型的 selector：优先从错误 message 的 provider/model 字段取（pi 重试后 ctx.model 可能已非请求模型）
+        const errSel = msg.provider && msg.model ? `${msg.provider}/${msg.model}` : currentSelector(ctx);
+        const isAuth = /\b(401|402|403)\b|unauthorized|forbidden|payment/i.test(errText);
+        const isQuota = /AccountQuotaExceeded|quota.*exceeded|exceeded.*quota/i.test(errText);
+        const is429 = /\b429\b|TooManyRequests|rate.?limit/i.test(errText);
+        if (errSel && cfg0.enabled && (isAuth || isQuota || is429)) {
+          if (probe) probe.markAuthFailure(errSel);
+          cooldowns.add(errSel, isQuota || isAuth ? 60 * 60 * 1000 : 10 * 60 * 1000, `api_error: ${errText.slice(0, 80)}`);
+          ctx.ui.notify(`⚡ router: ${errSel} API 失败（${isQuota ? "额度耗尽" : isAuth ? "套餐失效" : "429 限流"}）— 本 session 排除，秒切其他供应商`, "error");
+          void tryImmediateFallback(errSel, ctx, isQuota ? "quota exceeded" : isAuth ? "auth failed" : "429");
+          return; // 失败轮不记录缓存/学习
+        }
+      }
+      if (!msg.usage) return;
       const cfg = watcher?.get() ?? loadConfig(ctx.cwd);
       const sel = currentSelector(ctx);
       if (!sel) return;
