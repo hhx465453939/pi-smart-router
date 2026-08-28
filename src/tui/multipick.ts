@@ -104,6 +104,9 @@ export interface PickerTheme {
   fg: (color: string, text: string) => string;
 }
 
+// 注：pi theme.fg 是实例方法（内部访问 this.fgColors），必须闭包调用保持 this 绑定；
+// 直接解构 theme?.fg 会丢失 this → "Cannot read properties of undefined (reading 'fgColors')" → pi 崩溃
+
 function fmtCtx(n?: number): string {
   if (!n) return "";
   if (n >= 1000) return `${Math.round(n / 1000)}M`;
@@ -120,7 +123,8 @@ const MAX_VISIBLE = 12;
 
 /** 渲染：搜索行 + 勾选列表（滚动窗口）+ 帮助行 */
 export function renderPicker(state: PickerState, width: number, theme?: PickerTheme): string[] {
-  const fg = theme?.fg ?? ((_c: string, t: string) => t);
+  // 闭包包装保持 this 绑定（见文件头注释）；无 theme 时纯文本
+  const fg: (color: string, text: string) => string = theme ? (c, t) => theme.fg(c, t) : (_c, t) => t;
   const lines: string[] = [];
   lines.push(fg("accent", "模型池") + fg("dim", " ─ 输入搜索 · ↑↓移动 · 空格勾选 · 回车保存 · esc取消"));
   lines.push(fg("muted", `搜索: ${state.query || ""}█`));

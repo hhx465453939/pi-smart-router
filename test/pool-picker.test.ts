@@ -145,3 +145,27 @@ describe("pool picker reducer", () => {
     assert.ok(lines.some((l) => l.includes("无匹配")));
   });
 });
+
+describe("theme binding (pi crash regression)", () => {
+  it("fg must be invoked with this bound (method-owning theme must not crash)", () => {
+    // 模拟 pi 真实 theme：fg 是依赖 this 的实例方法（内部访问 this.colors）
+    const themeLikePi = {
+      colors: { accent: "[A]", dim: "[D]", success: "[S]", warning: "[W]", muted: "[M]" },
+      fg(this: { colors: Record<string, string> }, color: string, text: string): string {
+        return (this.colors[color] ?? "") + text; // this 丢失时这里抛 TypeError
+      },
+    };
+    const s = initPickerState(ITEMS, ["zai-coding-cn/glm-5.3"]);
+    // 旧实现（解构 theme?.fg）在此调用会抛 "Cannot read properties of undefined"
+    const lines = renderPicker(s, 100, themeLikePi);
+    assert.ok(lines.length >= 4);
+    assert.ok(lines.some((l) => l.includes("[A]") || l.includes("模型池")));
+    assert.ok(lines.some((l) => l.includes("[S]✓") || l.includes("✓")));
+  });
+
+  it("no-theme render stays plain text (no crash)", () => {
+    const s = initPickerState(ITEMS);
+    const lines = renderPicker(s, 80, undefined);
+    assert.ok(lines.length >= 4);
+  });
+});
