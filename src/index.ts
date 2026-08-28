@@ -162,9 +162,18 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify(`router: 无其他可用模型可切（${failedSelector} 已排除）`, "warning");
       return false;
     }
-    // 切换模型并静默重试本轮 prompt（用 selector 字符串调用，让 pi 内部解析，更稳健）
+    // 切换模型并静默重试本轮 prompt
+    // pi.setModel 期望 model 对象（内部 checkAuth(model.provider)），字符串会失败；
+    // 先用 modelRegistry.find 解析为对象，失败再试字符串兼容。
     try {
-      const ok = await pi.setModel(next as never);
+      let ok = false;
+      try {
+        const reg = (ctx as unknown as { modelRegistry?: { find?: (p: string, id: string) => unknown } }).modelRegistry;
+        const [p, ...rest] = next.split("/");
+        const modelObj = reg?.find?.(p, rest.join("/"));
+        if (modelObj) ok = (await pi.setModel(modelObj as never)) !== false;
+      } catch { /* 尝试字符串兼容 */ }
+      if (!ok) ok = (await pi.setModel(next as never)) !== false;
       if (!ok) {
         ctx.ui.notify(`router: 切换到 ${next} 失败（无权限或找不到）`, "warning");
         return false;
