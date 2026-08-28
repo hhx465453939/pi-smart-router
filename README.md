@@ -344,9 +344,22 @@ src/
 ## 开发
 
 ```bash
-npm test        # node --test（引擎单测，118 tests，含 cache/learn/churn/catalog/difficulty/selflearn/probe/profile）
+npm test        # node --test（引擎单测，126 tests，含 cache/learn/churn/catalog/difficulty/selflearn/probe/profile/quota-fallback）
 npm run typecheck  # tsc --noEmit
 ```
+
+### 路由 Harness（e2e fallback 测试能力）
+
+`scripts/router-harness.ts` 提供“开发+模型 fallback 测试的能力”：直接驱动扩展、模拟 pi 事件链、复现 401/402/403/429 quota 等不可用场景，可在本地秒级验证 router 行为而不依赖真实 LLM：
+
+```bash
+# 复现你贴的 bug：volces 额度耗尽 + huge-context 规则反复切回
+timeout 30 node --experimental-strip-types scripts/router-harness.ts
+
+# 预期输出：连续 429 → 标 unavailable → 秒切到其他供应商同类模型（opencode/shudie）→ 重试 → PASS
+```
+
+harness 可扩展：编写新 scenario 复现其它 bug（套餐过期、探测误杀、多 provider fallback 耗尽等），替代“改完靠真实环境试错”。
 
 ## 致谢
 
