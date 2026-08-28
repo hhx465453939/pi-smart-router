@@ -1,6 +1,6 @@
 # pi-smart-router
 
-> 智能模型路由扩展 for [pi](https://github.com/earendil-works/pi) — 根据任务特征自动选择最优模型，支持规则引擎、模型链回退、失败冷却与**缓存感知的路由（核心特色）**。逻辑提炼自 [claude-code-router](https://github.com/musistudio/claude-code-router)，原生继承 pi 优秀的缓存机制，多跳转运中保留 `sessionId` 前缀缓存。
+> 智能模型路由扩展 for [pi](https://github.com/earendil-works/pi) — 根据任务特征自动选择最优模型，支持规则引擎、模型链回退、失败冷却、**缓存感知的路由（核心特色）** 与 **自适应学习路由**。逻辑提炼自 [claude-code-router](https://github.com/musistudio/claude-code-router)，原生继承 pi 优秀的缓存机制，多跳转运中保留 `sessionId` 前缀缓存。
 
 ## 核心特色：缓存感知的路由
 
@@ -16,7 +16,19 @@ pi 通过 `sessionId` 前缀缓存（Anthropic `cache_control` / OpenAI `prompt_
 - **多跳保留**：`turn` → `request` 两级与 `model-chain` fallback 共享同一 `sessionId` 前缀，`message_end` 回填 `cacheRead/cacheWrite` 更新命中统计
 - **可观测**：`/router status` 与 `/router cache` 展示每模型 `hitRate` / `prefix` / `read/write`
 
-详见 `tasks/CHG-001/SPEC-v2.md` 的 ADR-004 / ADR-005。
+### 切换抖动量化（churn）
+
+> **切模型要付缓存代价，值不值得？**
+
+`churn.enabled` 时，决策会估算切走当前模型将丢失的缓存 token（按前缀长度折算）。若损失超过 `maxChurnTokens`：无规则决策（学习/粘滞/默认层）倾向保持当前模型以保缓存，并在 reason 标注 `churn≈N tok`；**规则命中仍优先**（确定性不被牺牲）。
+
+### 自适应学习路由（learn）
+
+> **规则不必手写，路由自己会学。**
+
+`learn.enabled` 时，每轮 `message_end` 记录实际结果（成本、缓存命中、成败），按 `taskType` 累计得分：成功加分、失败强惩罚、缓存命中加成、成本惩罚。`minSamples` 样本门槛后才生效，`windowSize` 限制规模。决策顺序：显式 > 高优规则 > **学习偏好** > 粘滞 > 默认 > fallback。`/router learn` 查看每个任务类型下各模型得分。
+
+详见 `tasks/CHG-002/SPEC.md` 的 ADR-006 / ADR-007 / ADR-008。
 
 ## 为什么
 
@@ -52,10 +64,10 @@ pi -e ./src/index.ts
 - 全局：`~/.pi/agent/pi-router.json`
 - 项目级：`<cwd>/.pi/pi-router.json`（覆盖全局）
 
-示例见 `examples/pi-router.json`，可直接复制为起点：
+示例见 `examples/pi-router.json`（通用），或 **`examples/pi-router.cn.json`（中文生态模板，贴合 zai-coding-cn / opencode-go / kimi-coding / shudie / volces 环境）**：
 
 ```bash
-cp examples/pi-router.json ~/.pi/agent/pi-router.json
+cp examples/pi-router.cn.json ~/.pi/agent/pi-router.json
 ```
 
 最小可用配置（仅默认模型 + 一条规则）：
@@ -143,7 +155,7 @@ cp examples/pi-router.json ~/.pi/agent/pi-router.json
 
 可在配置中通过 `explicitModelPrefix` 自定义前缀。
 
-### 缓存配置（cache）
+### 缓存/学习/churn 配置（cache / learn / churn）
 
 ```jsonc
 {
@@ -153,6 +165,19 @@ cp examples/pi-router.json ~/.pi/agent/pi-router.json
     "minHitChars": 1024,   // 视为有效命中的最小公共前缀字符数
     "sticky": true,        // 同 taskType 粘滞以保缓存
     "stickyTtlMs": 300000   // 粘滞窗口（毫秒）
+  },
+  "learn": {
+    "enabled": true,       // 自适应学习路由
+    "windowSize": 50,      // 每 taskType 最多模型数
+    "minSamples": 3,       // 生效前最少样本数
+    "successWeight": 1.0,
+    "failureWeight": -2.0, // 失败强惩罚
+    "cacheWeight": 0.0005, // 缓存命中加成（每 cacheRead token）
+    "costWeight": -0.0001  // 成本惩罚（每美元）
+  },
+  "churn": {
+    "enabled": true,       // 切换抖动量化
+    "maxChurnTokens": 8000 // 损失超过此值倾向保持当前
   }
 }
 ```
@@ -165,12 +190,14 @@ cp examples/pi-router.json ~/.pi/agent/pi-router.json
 扩展注册 `/router` 命令：
 
 ```
-/router                 — 状态（当前模型、可用模型、规则、冷却、缓存、最近决策）
+/router                 — 状态（当前模型、可用模型、规则、冷却、缓存、学习、最近决策）
 /router rules           — 已编译规则列表
 /router cache           — 每模型缓存命中统计
+/router learn           — 每 taskType 学习得分
 /router reload          — 从 pi-router.json 热加载配置
 /router clear [model]   — 清除指定模型或全部冷却
 /router clear-cache     — 清除缓存记录
+/router clear-learn     — 清除学习状态
 /router clear-history   — 清除决策历史
 /router toggle          — 启用/禁用（内存）
 /router test <prompt>   — 干跑：对给定 prompt 做路由决策但不切模型
@@ -188,7 +215,8 @@ cp examples/pi-router.json ~/.pi/agent/pi-router.json
 - **失败冷却**：`after_provider_response` 收到 429/5xx 时，或 `tool_result` 命中错误特征时，标记模型冷却 `cooldownMs`，下次决策自动规避并走 fallback 链。
 - **Fallback**：`off`（单次）、`retry`（重试 N 次）、`model-chain`（按序尝试备用模型）。
 - **可观测**：决策历史与缓存记录持久化到会话（`pi.appendEntry`），状态条 `⚡ model → reason`，`/router cache` 展示命中率，`verbose` 时控制台日志。
-- **缓存感知**：见上节核心特色，`message_end` 回填 `cacheRead/cacheWrite` 更新 `hitRate`，多跳共享 `sessionId`。
+- **缓存感知 + churn**：见上节核心特色，`message_end` 回填 `cacheRead/cacheWrite` 更新 `hitRate`，多跳共享 `sessionId`；切模型前估算 churn 损失。
+- **学习路由**：`message_end` 记录成功（成本/缓存），失败（429/5xx/工具错误）强惩罚，`/router learn` 查看，`session_before_compact` 重置缓存前缀。
 
 ## 架构
 
@@ -198,12 +226,13 @@ src/
   types.ts            # 类型契约
   config.ts           # 配置加载（分层 + 归一化 + 热加载）
   engine/
-    cache.ts          # 缓存感知（CacheManager，前缀/命中率/粘滞/多跳保留）
+    cache.ts          # 缓存感知（CacheManager，前缀/命中率/粘滞/多跳保留/churn 估算）
+    learn.ts          # 自适应学习（LearningManager，按 taskType 得分/惩罚/门槛）
     conditions.ts     # 条件评估（提炼自 CCR）
     registry.ts       # 选择器归一化与冷却集合
     planner.ts        # 执行计划（retry / model-chain）
     rules.ts          # 规则编译与匹配
-    decision.ts       # 决策引擎（显式 > 粘滞 > 规则 > 默认 > fallback，缓存感知）
+    decision.ts       # 决策引擎（显式 > 规则 > 学习 > 粘滞 > 默认 > fallback，缓存+churn 感知）
     failure.ts        # 失败分类
   context/
     task.ts           # 任务特征提取（prompt → TaskFeatures）
@@ -217,12 +246,12 @@ src/
     router.ts         # router_status 工具
 ```
 
-详细契约见 `tasks/CHG-001/SPEC.md` 与 `TRACEABILITY.md`。
+详细契约见 `tasks/CHG-001/SPEC.md`、`tasks/CHG-002/SPEC.md` 与 `TRACEABILITY.md`。
 
 ## 开发
 
 ```bash
-npm test        # node --test（引擎单测，65 tests，含 cache）
+npm test        # node --test（引擎单测，77 tests，含 cache/learn/churn）
 npm run typecheck  # tsc --noEmit
 ```
 

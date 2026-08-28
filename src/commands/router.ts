@@ -6,6 +6,7 @@ import type { NormalizedRouterConfig, DecisionRecord } from "../types.ts";
 import type { CooldownSet } from "../engine/registry.ts";
 import type { CompiledRule } from "../engine/rules.ts";
 import type { CacheManager } from "../engine/cache.ts";
+import type { LearningManager } from "../engine/learn.ts";
 
 export interface RouterCommandDeps {
   getConfig(): NormalizedRouterConfig;
@@ -13,6 +14,7 @@ export interface RouterCommandDeps {
   recompileRules(): CompiledRule[];
   cooldowns: CooldownSet;
   cacheManager?: CacheManager;
+  learning?: LearningManager;
   getHistory(): DecisionRecord[];
   clearHistory(): void;
   getCurrentModel(): string | undefined;
@@ -27,6 +29,10 @@ export function formatStatus(deps: RouterCommandDeps): string {
   if (cache) {
     lines.push(`cache: ${cache.enabled ? "✅" : "⏸️ "} prefer=${cache.preferCache ? "on" : "off"} sticky=${cache.sticky ? "on" : "off"}`);
   }
+  const learn = (cfg as unknown as { learn?: { enabled?: boolean } }).learn;
+  if (learn) lines.push(`learn: ${learn.enabled ? "✅" : "⏸️ "}`);
+  const churn = (cfg as unknown as { churn?: { enabled?: boolean; maxChurnTokens?: number } }).churn;
+  if (churn) lines.push(`churn: ${churn.enabled ? "✅" : "⏸️ "}${churn.maxChurnTokens ? ` max=${churn.maxChurnTokens}tok` : ""}`);
   lines.push(`current: ${deps.getCurrentModel() ?? "(none)"}`);
   lines.push(`available: ${deps.getAvailableModels().join(", ") || "(none)"}`);
   lines.push(`rules: ${cfg.rules.length}  fallback: ${cfg.fallback?.mode ?? "off"}${cfg.fallback?.models?.length ? ` → ${cfg.fallback.models.join(", ")}` : ""}`);

@@ -8,12 +8,14 @@ import { decide } from "../engine/decision.ts";
 import type { CompiledRule } from "../engine/rules.ts";
 import type { CooldownSet } from "../engine/registry.ts";
 import type { CacheManager } from "../engine/cache.ts";
+import type { LearningManager } from "../engine/learn.ts";
 
 export interface ProviderHookDeps {
   config: NormalizedRouterConfig;
   compiledRules: CompiledRule[];
   cooldowns: CooldownSet;
   cacheManager?: CacheManager;
+  learning?: LearningManager;
   sessionId?: string;
 }
 
@@ -89,6 +91,7 @@ export function resolveProviderDecision(input: ProviderHookInput): { selector: s
     cooldowns: deps.cooldowns,
     availableModels: input.availableModels,
     cacheManager: deps.cacheManager,
+    learning: deps.learning,
     sessionId: deps.sessionId,
     promptText: features.promptText,
   });

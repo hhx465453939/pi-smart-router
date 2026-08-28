@@ -9,6 +9,7 @@ import { CooldownSet } from "./registry.ts";
 import { pickAvailableModel, createExecutionPlan } from "./planner.ts";
 import { type CompiledRule, matchFirstRule } from "./rules.ts";
 import type { CacheManager } from "./cache.ts";
+import type { LearningManager } from "./learn.ts";
 
 export interface DecisionInput {
   features: TaskFeatures;
@@ -17,6 +18,7 @@ export interface DecisionInput {
   cooldowns: CooldownSet;
   availableModels: Set<string>;
   cacheManager?: CacheManager;
+  learning?: LearningManager;
   sessionId?: string;
   promptText?: string;
 }
@@ -49,11 +51,40 @@ function fallbackAvailable(
   return chain[0];
 }
 
+/** 估算切到目标模型将丢失的缓存 token（相对当前模型） */
+function estimateChurn(
+  current: string | undefined,
+  target: string | undefined,
+  cacheManager: CacheManager | undefined,
+  sessionId: string,
+  promptText: string,
+): number {
+  if (!current || !target || !cacheManager || !sessionId || !promptText) return 0;
+  const currentLower = current.toLowerCase();
+  const targetLower = target.toLowerCase();
+  if (currentLower === targetLower) return 0;
+  const est = cacheManager.estimate(current, sessionId, promptText);
+  return Math.round(est.commonPrefixChars / 4);
+}
+
 export function decide(input: DecisionInput): RouteDecision {
-  const { features, config, compiledRules, cooldowns, availableModels, cacheManager, sessionId, promptText } = input;
+  const { features, config, compiledRules, cooldowns, availableModels, cacheManager, learning, sessionId, promptText } = input;
   const now = Date.now();
   const prompt = promptText ?? features.promptText ?? "";
   const sid = sessionId ?? "";
+  const current = features.currentModel;
+
+  /** 决策时如果目标 ≠ 当前且 churn 超阈值，在 reason 标注；规则仍优先，非规则层则倾向保持 */
+  const churnNote = (target: string): string => {
+    if (!config.churn.enabled || !current) return "";
+    const loss = estimateChurn(current, target, cacheManager, sid, prompt);
+    return loss > 0 ? ` churn≈${loss}tok` : "";
+  };
+  const shouldKeepForChurn = (target: string): boolean => {
+    if (!config.churn.enabled || !current) return false;
+    const loss = estimateChurn(current, target, cacheManager, sid, prompt);
+    return loss > config.churn.maxChurnTokens;
+  };
 
   // 1. 显式指定：强制，不做冷却规避与规则
   if (features.explicitModel) {
@@ -92,8 +123,8 @@ export function decide(input: DecisionInput): RouteDecision {
     }
 
     if (isAvailable(desired, availableModels)) {
-      // cacheAware 规则：若命中模型缓存较冷而 fallback 中有更热模型，且规则未强制 cacheAware=false，则提示但仍尊重优先级
-      return { selector: desired, reason: `rule "${matched.id}" → ${desired}`, ruleId: matched.id, source: "rule", timestamp: now };
+      // 规则命中：尊重规则（即便 churn 大，规则优先）；reason 标注 churn
+      return { selector: desired, reason: `rule "${matched.id}" → ${desired}${churnNote(desired)}`, ruleId: matched.id, source: "rule", timestamp: now };
     }
     // 规则命中但模型不可用 → 尝试 fallback（缓存感知）
     const alt = fallbackAvailable(config, cooldowns, availableModels, isCacheAware ? cacheManager : undefined, sid, prompt);
@@ -103,7 +134,20 @@ export function decide(input: DecisionInput): RouteDecision {
     return { selector: undefined, reason: `rule "${matched.id}" model "${desired}" unavailable`, ruleId: matched.id, source: "rule", timestamp: now };
   }
 
-  // 3. 粘滞优先（同 taskType 连续轮次）—— 在 default 之前检查
+  // 3. 学习偏好（learn）—— 在粘滞之前，minSamples 门槛
+  if (learning && config.learn.enabled) {
+    const learned = learning.preferred(features.taskType, config.learn);
+    if (learned && isAvailable(learned, availableModels) && !cooldowns.isCooldown(learned)) {
+      // churn：若切走会丢缓存且超过阈值，倾向保持当前（保缓存）
+      if (shouldKeepForChurn(learned) && current) {
+        const loss = estimateChurn(current, learned, cacheManager, sid, prompt);
+        return { selector: current, reason: `learn→${learned} but churn≈${loss}tok > ${config.churn.maxChurnTokens}; keep ${current} (cache)`, ruleId: undefined, source: "keep", timestamp: now };
+      }
+      return { selector: learned, reason: `learn[${features.taskType}] → ${learned}${churnNote(learned)}`, ruleId: undefined, source: "default", timestamp: now };
+    }
+  }
+
+  // 4. 粘滞优先（同 taskType 连续轮次）—— 在 default 之前检查
   if (cacheManager && sid && config.cache?.enabled && config.cache?.sticky) {
     const stickySel = cacheManager.stickyPreferred(features.taskType, config);
     if (stickySel && isAvailable(stickySel, availableModels) && !cooldowns.isCooldown(stickySel)) {
@@ -111,7 +155,7 @@ export function decide(input: DecisionInput): RouteDecision {
     }
   }
 
-  // 4. 默认模型（也受冷却 + 可用性约束，fallback 缓存感知）
+  // 5. 默认模型（也受冷却 + 可用性约束，fallback 缓存感知）
   if (config.defaultModel) {
     const def = config.defaultModel.trim();
     if (isAvailable(def, availableModels) && !cooldowns.isCooldown(def)) {
@@ -127,7 +171,7 @@ export function decide(input: DecisionInput): RouteDecision {
     }
   }
 
-  // 5. fallback 链兜底（缓存感知排序）
+  // 6. fallback 链兜底（缓存感知排序）
   {
     let plan = createExecutionPlan({ primary: config.defaultModel, fallback: config.fallback });
     // 对 fallback 链做缓存排序
@@ -151,6 +195,6 @@ export function decide(input: DecisionInput): RouteDecision {
     }
   }
 
-  // 5. 保持当前
+  // 7. 保持当前
   return { selector: undefined, reason: "keep current (no routing decision)", ruleId: undefined, source: "keep", timestamp: now };
 }

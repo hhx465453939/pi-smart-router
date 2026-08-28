@@ -11,25 +11,36 @@ import type { DecisionRecord, NormalizedRouterConfig } from "./types.ts";
 import { loadConfig, createConfigWatcher, type ConfigWatcher } from "./config.ts";
 import { CooldownSet } from "./engine/registry.ts";
 import { CacheManager } from "./engine/cache.ts";
+import { LearningManager } from "./engine/learn.ts";
 import { compileRules, type CompiledRule } from "./engine/rules.ts";
 import { resolveTurnDecision } from "./hooks/agent.ts";
 import { resolveProviderDecision } from "./hooks/provider.ts";
 import { onProviderResponse, onToolResult } from "./hooks/failure.ts";
 import { formatRules, formatStatus } from "./commands/router.ts";
 import { buildRouterTool } from "./tool/router.ts";
+import { classifyTaskType } from "./context/task.ts";
 
 export default function (pi: ExtensionAPI) {
   let watcher: ConfigWatcher | null = null;
   let compiledRules: CompiledRule[] = [];
   let cooldowns = new CooldownSet();
   let cacheManager = new CacheManager();
+  let learning = new LearningManager();
   let history: DecisionRecord[] = [];
   let turnIndex = 0;
   let lastPromptText = "";
+  let lastTaskType = "general";
 
   const DECISION_ENTRY = "pi-smart-router-decision";
   const CACHE_ENTRY = "pi-smart-router-cache";
+  const LEARN_ENTRY = "pi-smart-router-learn";
   const MAX_HISTORY = 50;
+
+  function classifyGuess(prompt: string): string {
+    try {
+      return classifyTaskType(prompt, watcher?.get()?.taskTypeRules ?? {});
+    } catch { return "general"; }
+  }
 
   function currentSelector(ctx: ExtensionContext): string | undefined {
     const m: unknown = (ctx as unknown as Record<string, unknown>).model;
@@ -98,6 +109,7 @@ export default function (pi: ExtensionAPI) {
       compiledRules = compileRules(cfg.rules).compiled;
       history = [];
       cacheManager = new CacheManager();
+      learning = new LearningManager();
       try {
         const entries = (ctx.sessionManager as unknown as { getEntries?: () => Array<{ type: string; customType?: string; data?: unknown }> }).getEntries?.() ?? [];
         for (const e of entries) {
@@ -118,8 +130,9 @@ export default function (pi: ExtensionAPI) {
       const cur = currentSelector(ctx);
       const status = cfg.enabled ? `enabled (${cfg.routingLevel})` : "disabled";
       const cacheStatus = cfg.cache.enabled ? `cache:on` : `cache:off`;
-      ctx.ui.setStatus("router", `⚡ ${status} ${cacheStatus}${cur ? ` · ${cur}` : ""}`);
-      if (cfg.verbose) console.log(`[pi-smart-router] loaded: ${status}, ${cacheStatus}, rules=${cfg.rules.length}, cooldowns=${cooldowns.all().length}`);
+      const learnStatus = cfg.learn.enabled ? `learn:on` : `learn:off`;
+      ctx.ui.setStatus("router", `⚡ ${status} ${cacheStatus} ${learnStatus}${cur ? ` · ${cur}` : ""}`);
+      if (cfg.verbose) console.log(`[pi-smart-router] loaded: ${status}, ${cacheStatus}, ${learnStatus}, rules=${cfg.rules.length}, cooldowns=${cooldowns.all().length}`);
     } catch (err) {
       console.error(`[pi-smart-router] session_start error: ${err}`);
     }
@@ -140,6 +153,7 @@ export default function (pi: ExtensionAPI) {
     const sid = sessionIdOf(ctx);
     const promptText = (event as unknown as { prompt?: string }).prompt ?? "";
     lastPromptText = promptText;
+    lastTaskType = (event as unknown as { systemPromptOptions?: { taskType?: string } }).systemPromptOptions?.taskType ?? classifyGuess(promptText);
 
     const rec = resolveTurnDecision({
       prompt: promptText,
@@ -156,6 +170,7 @@ export default function (pi: ExtensionAPI) {
         compiledRules,
         cooldowns,
         cacheManager,
+        learning,
         sessionId: sid,
         pushDecision: (r) => pushDecision(r, ctx),
         setStatus: (t) => ctx.ui.setStatus("router", t),
@@ -221,7 +236,7 @@ export default function (pi: ExtensionAPI) {
       turnIndex,
       contextTokens: contextTokens(ctx),
       availableModels: available,
-      deps: { config: cfg, compiledRules, cooldowns, cacheManager, sessionId: sid },
+      deps: { config: cfg, compiledRules, cooldowns, cacheManager, learning, sessionId: sid },
     });
 
     if (!res) return;
@@ -238,7 +253,7 @@ export default function (pi: ExtensionAPI) {
     return next;
   });
 
-  // ——— after_provider_response: 失败冷却 + 缓存统计 ———
+  // ——— after_provider_response: 失败冷却 + 学习失败记录 ———
   pi.on("after_provider_response", (event, ctx) => {
     const cfg = watcher?.get() ?? loadConfig(ctx.cwd);
     onProviderResponse(
@@ -251,44 +266,80 @@ export default function (pi: ExtensionAPI) {
         log: (msg) => { if (cfg.verbose) console.log(msg); },
       },
     );
+    // 学习：失败状态码 → 该 taskType 该模型降权
+    if (cfg.learn.enabled && (event.status === 429 || event.status >= 500)) {
+      const sel = currentSelector(ctx);
+      if (sel) {
+        const taskType = lastTaskType ?? "general";
+        learning.recordFailure(taskType, sel, cfg.learn);
+        try { pi.appendEntry(LEARN_ENTRY, { taskType, selector: sel, success: false, timestamp: Date.now() } as never); } catch { /* ignore */ }
+      }
+    }
   });
 
-  // ——— message_end: 回填缓存 usage（核心特色） ———
+  // ——— message_end: 回填缓存 usage（核心特色）+ 学习成功记录 ———
   pi.on("message_end", async (event, ctx) => {
     try {
-      const msg = (event as unknown as { message?: { role?: string; usage?: { cacheRead?: number; cacheWrite?: number; input?: number; output?: number } } }).message;
+      const msg = (event as unknown as { message?: { role?: string; usage?: { cacheRead?: number; cacheWrite?: number; input?: number; output?: number; cost?: { total?: number } } } }).message;
       if (!msg || msg.role !== "assistant" || !msg.usage) return;
       const cfg = watcher?.get() ?? loadConfig(ctx.cwd);
-      if (!cfg.cache.enabled) return;
       const sel = currentSelector(ctx);
       if (!sel) return;
       const sid = sessionIdOf(ctx);
       const usage = msg.usage;
-      cacheManager.recordUsage(sel, sid, lastPromptText, { cacheRead: usage.cacheRead ?? 0, cacheWrite: usage.cacheWrite ?? 0 });
-      // 持久化一条轻量 cache 记录（便于 /router status 展示与恢复）
-      try {
-        const rec = cacheManager.getRecord(sel);
-        if (rec) pi.appendEntry(CACHE_ENTRY, rec as unknown as Record<string, unknown>);
-      } catch { /* ignore */ }
-      if (cfg.verbose && (usage.cacheRead ?? 0) > 0) {
-        console.log(`[pi-smart-router] cache hit: ${sel} read=${usage.cacheRead} write=${usage.cacheWrite}`);
+      if (cfg.cache.enabled) {
+        cacheManager.recordUsage(sel, sid, lastPromptText, { cacheRead: usage.cacheRead ?? 0, cacheWrite: usage.cacheWrite ?? 0 });
+        // 持久化一条轻量 cache 记录（便于 /router status 展示与恢复）
+        try {
+          const rec = cacheManager.getRecord(sel);
+          if (rec) pi.appendEntry(CACHE_ENTRY, rec as unknown as Record<string, unknown>);
+        } catch { /* ignore */ }
+        if (cfg.verbose && (usage.cacheRead ?? 0) > 0) {
+          console.log(`[pi-smart-router] cache hit: ${sel} read=${usage.cacheRead} write=${usage.cacheWrite}`);
+        }
+      }
+      // 学习：成功结果 → 该 taskType 该模型加分（含缓存命中与成本）
+      if (cfg.learn.enabled) {
+        const taskType = lastTaskType ?? "general";
+        const cost = typeof usage.cost?.total === "number" ? usage.cost.total : 0;
+        learning.recordOutcome({
+          taskType,
+          selector: sel,
+          cost,
+          cacheRead: usage.cacheRead ?? 0,
+          success: true,
+          timestamp: Date.now(),
+        }, cfg.learn);
+        try { pi.appendEntry(LEARN_ENTRY, { taskType, selector: sel, cost, cacheRead: usage.cacheRead ?? 0, success: true, timestamp: Date.now() } as never); } catch { /* ignore */ }
       }
     } catch { /* ignore */ }
   });
 
-  // ——— tool_result: 工具错误冷却 ———
+  // ——— session_before_compact: compaction 后重置缓存前缀（避免旧前缀误导） ———
+  pi.on("session_before_compact", async (_event, _ctx) => {
+    try { cacheManager.invalidatePrefix(); } catch { /* ignore */ }
+  });
+
+  // ——— tool_result: 工具错误冷却 + 学习失败记录 ———
   pi.on("tool_result", async (event, ctx) => {
     const cfg = watcher?.get() ?? loadConfig(ctx.cwd);
+    const sel = currentSelector(ctx);
     onToolResult(
       { isError: (event as unknown as { isError?: boolean }).isError, content: (event as unknown as { content?: unknown }).content },
       {
         config: cfg,
         cooldowns,
-        currentModelSelector: () => currentSelector(ctx),
+        currentModelSelector: () => sel,
         notify: (msg, level) => ctx.ui.notify(msg, level ?? "warning"),
         log: (msg) => { if (cfg.verbose) console.log(msg); },
       },
     );
+    // 学习：工具错误且命中冷却 → 该模型降权
+    if (cfg.learn.enabled && (event as unknown as { isError?: boolean }).isError && sel) {
+      const taskType = lastTaskType ?? "general";
+      learning.recordFailure(taskType, sel, cfg.learn);
+      try { pi.appendEntry(LEARN_ENTRY, { taskType, selector: sel, success: false, timestamp: Date.now() } as never); } catch { /* ignore */ }
+    }
   });
 
   // ——— model_select: 更新状态条 ———
@@ -301,7 +352,7 @@ export default function (pi: ExtensionAPI) {
 
   // ——— /router 命令 ———
   pi.registerCommand("router", {
-    description: "pi-smart-router: status / rules / reload / clear-cooldown / toggle / test / cache",
+    description: "pi-smart-router: status / rules / reload / clear-cooldown / toggle / test / cache / learn",
     handler: async (args, ctx) => {
       const raw = String(args ?? "").trim();
       const [sub, ...rest] = raw.split(/\s+/).filter(Boolean);
@@ -317,6 +368,7 @@ export default function (pi: ExtensionAPI) {
         recompileRules: () => compileRules((watcher?.get() ?? loadConfig(ctx.cwd)).rules).compiled,
         cooldowns,
         cacheManager,
+        learning,
         getHistory: () => history,
         clearHistory: () => { history = []; },
         getCurrentModel: () => currentSelector(ctx as unknown as ExtensionContext),
@@ -343,7 +395,26 @@ export default function (pi: ExtensionAPI) {
       }
       if (cmd === "reload") {
         const cfg = deps.reloadConfig();
-        ctx.ui.notify(`router reloaded: ${cfg.enabled ? "enabled" : "disabled"} · rules=${cfg.rules.length} · level=${cfg.routingLevel} · cache=${cfg.cache.enabled ? "on" : "off"}`, "info");
+        ctx.ui.notify(`router reloaded: ${cfg.enabled ? "enabled" : "disabled"} · rules=${cfg.rules.length} · level=${cfg.routingLevel} · cache=${cfg.cache.enabled ? "on" : "off"} · learn=${cfg.learn.enabled ? "on" : "off"}`, "info");
+        return;
+      }
+      if (cmd === "learn") {
+        const all = learning.all();
+        if (!all.length) { ctx.ui.notify("learn: no samples yet", "info"); return; }
+        const lines = ["learn scores:"];
+        for (const { taskType, scores } of all) {
+          const top = scores[0];
+          lines.push(`  ${taskType}: → ${top.selector} (score=${top.score.toFixed(2)}, n=${top.samples})`);
+          for (const s of scores.slice(1, 4)) {
+            lines.push(`    - ${s.selector} score=${s.score.toFixed(2)} n=${s.samples}`);
+          }
+        }
+        ctx.ui.notify(lines.join("\n"), "info");
+        return;
+      }
+      if (cmd === "clear-learn") {
+        learning.clear();
+        ctx.ui.notify("learn state cleared", "info");
         return;
       }
       if (cmd === "clear-cooldown" || cmd === "clear") {
@@ -397,6 +468,7 @@ export default function (pi: ExtensionAPI) {
             compiledRules,
             cooldowns,
             cacheManager,
+            learning,
             sessionId: sid,
             pushDecision: () => {},
             setStatus: () => {},
@@ -410,12 +482,14 @@ export default function (pi: ExtensionAPI) {
       if (cmd === "help" || cmd === "h") {
         ctx.ui.notify([
           "/router [subcommand]",
-          "  status (default) — current model / rules / cooldowns / cache / recent decisions",
+          "  status (default) — current model / rules / cooldowns / cache / learn / recent decisions",
           "  rules            — list compiled rules",
           "  cache            — show per-model cache hit stats",
+          "  learn            — show per-taskType learned model scores",
           "  reload           — reload config from pi-router.json",
           "  clear [model]    — clear cooldown(s)",
           "  clear-cache      — clear cache records",
+          "  clear-learn      — clear learned state",
           "  clear-history    — clear decision history",
           "  toggle           — enable/disable router (memory only)",
           "  test <prompt>    — dry-run routing for a prompt",

@@ -1,0 +1,93 @@
+{
+  "enabled": true,
+  "defaultModel": "zai-coding-cn/glm-5.3",
+  "routingLevel": "turn",
+  "cooldownMs": 60000,
+  "failure": {
+    "cooldownOnStatus": [429, 500, 502, 503, 504],
+    "cooldownOnToolErrorPatterns": [
+      "rate.?limit",
+      "context.?length",
+      "overloaded",
+      "too.?many.?requests",
+      "service.?unavailable",
+      "timeout",
+      "429",
+      "503"
+    ]
+  },
+  "cache": {
+    "enabled": true,
+    "preferCache": true,
+    "minHitChars": 1024,
+    "sticky": true,
+    "stickyTtlMs": 300000
+  },
+  "learn": {
+    "enabled": true,
+    "windowSize": 50,
+    "minSamples": 3,
+    "successWeight": 1.0,
+    "failureWeight": -2.0,
+    "cacheWeight": 0.0005,
+    "costWeight": -0.0001
+  },
+  "churn": {
+    "enabled": true,
+    "maxChurnTokens": 8000
+  },
+  "taskTypeRules": {
+    "code": ["implement", "fix", "bug", "refactor", "function", "api", "test", "type", "error", "compile", "stack", "trace", "deploy", "migrate"],
+    "document": ["document", "readme", "doc", "explain", "summarize", "write", "draft", "proposal", "report"],
+    "research": ["research", "investigate", "analyze", "compare", "find", "search", "explore", "audit", "survey"]
+  },
+  "rules": [
+    {
+      "id": "code-task",
+      "name": "编码任务用推理强模型",
+      "priority": 100,
+      "when": { "taskType": "code" },
+      "model": "opencode-go/kimi-k3",
+      "cacheAware": true
+    },
+    {
+      "id": "long-context",
+      "name": "长上下文用 256k 窗口",
+      "priority": 90,
+      "when": { "contextTokens": { "gt": 80000 } },
+      "model": "kimi-coding/k3-256k"
+    },
+    {
+      "id": "image-task",
+      "name": "多模态任务",
+      "priority": 95,
+      "when": { "hasImage": true },
+      "model": "opencode-go/deepseek-v4-flash-vision-exp"
+    },
+    {
+      "id": "fast-task",
+      "name": "分析/研究用低成本快速模型",
+      "priority": 50,
+      "when": { "taskType": { "in": ["research", "analysis"] } },
+      "model": "opencode-go/glm-5.3-flash"
+    },
+    {
+      "id": "later-turns",
+      "name": "多轮后切稳态模型",
+      "priority": 10,
+      "when": { "turnIndex": { "gte": 6 } },
+      "model": "zai-coding-cn/glm-5.3"
+    }
+  ],
+  "fallback": {
+    "mode": "model-chain",
+    "models": [
+      "zai-coding-cn/glm-5.3",
+      "opencode-go/deepseek-v4-pro",
+      "shudie/DeepSeek-V4-Pro",
+      "zai-coding-cn/glm-5.3-flash"
+    ]
+  },
+  "explicitModelPrefix": "@model:",
+  "verbose": false
+}

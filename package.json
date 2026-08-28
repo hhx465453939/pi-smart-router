@@ -26,7 +26,8 @@
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "typebox": "*",
-    "typescript": "^5.5.0"
+    "typescript": "^5.5.0",
+    "@types/node": "^22.0.0"
   },
   "pi": {
     "extensions": [

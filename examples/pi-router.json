@@ -63,5 +63,18 @@
     "minHitChars": 1024,
     "sticky": true,
     "stickyTtlMs": 300000
+  },
+  "learn": {
+    "enabled": true,
+    "windowSize": 50,
+    "minSamples": 2,
+    "successWeight": 1.0,
+    "failureWeight": -2.0,
+    "cacheWeight": 0.0005,
+    "costWeight": -0.0001
+  },
+  "churn": {
+    "enabled": true,
+    "maxChurnTokens": 8000
   }
 }

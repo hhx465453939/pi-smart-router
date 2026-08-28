@@ -5,8 +5,8 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import type { NormalizedRouterConfig, RouterConfig } from "../types.ts";
-import { compileErrorPatterns } from "../engine/failure.ts";
+import type { NormalizedRouterConfig, RouterConfig } from "./types.ts";
+import { compileErrorPatterns } from "./engine/failure.ts";
 
 const GLOBAL_REL = ".pi/agent/pi-router.json";
 const PROJECT_REL = ".pi/pi-router.json";
@@ -29,13 +29,15 @@ export function projectConfigPath(cwd: string): string {
   return join(cwd, PROJECT_REL);
 }
 
-function deepMerge(base: RouterConfig, override: RouterConfig): RouterConfig {
+export function deepMerge(base: RouterConfig, override: RouterConfig): RouterConfig {
   if (!override) return base;
   const out: RouterConfig = { ...base, ...override };
   if (override.fallback) out.fallback = { ...(base.fallback as object ?? {}), ...(override.fallback as object) } as RouterConfig["fallback"];
   if (override.failure) out.failure = { ...(base.failure as object ?? {}), ...(override.failure as object) } as RouterConfig["failure"];
   if (override.taskTypeRules) out.taskTypeRules = { ...(base.taskTypeRules ?? {}), ...(override.taskTypeRules ?? {}) };
   if (override.cache) out.cache = { ...(base.cache as object ?? {}), ...(override.cache as object) } as RouterConfig["cache"];
+  if (override.learn) out.learn = { ...(base.learn as object ?? {}), ...(override.learn as object) } as RouterConfig["learn"];
+  if (override.churn) out.churn = { ...(base.churn as object ?? {}), ...(override.churn as object) } as RouterConfig["churn"];
   return out;
 }
 
@@ -48,6 +50,15 @@ export function normalizeConfig(raw: RouterConfig | undefined): NormalizedRouter
   const minHitChars = Number.isFinite(r.cache?.minHitChars as number) ? Math.max(0, Math.trunc(r.cache!.minHitChars as number)) : 1024;
   const sticky = r.cache?.sticky !== false;
   const stickyTtlMs = Number.isFinite(r.cache?.stickyTtlMs as number) ? Math.max(0, Math.trunc(r.cache!.stickyTtlMs as number)) : 300000;
+  const learnEnabled = r.learn?.enabled !== false;
+  const learnWindow = Number.isFinite(r.learn?.windowSize as number) ? Math.max(1, Math.trunc(r.learn!.windowSize as number)) : 50;
+  const learnMinSamples = Number.isFinite(r.learn?.minSamples as number) ? Math.max(1, Math.trunc(r.learn!.minSamples as number)) : 2;
+  const learnSW = Number.isFinite(r.learn?.successWeight as number) ? (r.learn!.successWeight as number) : 1.0;
+  const learnFW = Number.isFinite(r.learn?.failureWeight as number) ? (r.learn!.failureWeight as number) : -2.0;
+  const learnCW = Number.isFinite(r.learn?.cacheWeight as number) ? (r.learn!.cacheWeight as number) : 0.0005;
+  const learnCostW = Number.isFinite(r.learn?.costWeight as number) ? (r.learn!.costWeight as number) : -0.0001;
+  const churnEnabled = r.churn?.enabled !== false;
+  const churnMax = Number.isFinite(r.churn?.maxChurnTokens as number) ? Math.max(0, Math.trunc(r.churn!.maxChurnTokens as number)) : 8000;
   return {
     enabled: r.enabled !== false,
     defaultModel: typeof r.defaultModel === "string" ? r.defaultModel.trim() || undefined : undefined,
@@ -61,6 +72,8 @@ export function normalizeConfig(raw: RouterConfig | undefined): NormalizedRouter
     explicitModelPrefix: typeof r.explicitModelPrefix === "string" && r.explicitModelPrefix.trim() ? r.explicitModelPrefix.trim() : "@model:",
     verbose: Boolean(r.verbose),
     cache: { enabled: cacheEnabled, preferCache, minHitChars, sticky, stickyTtlMs },
+    learn: { enabled: learnEnabled, windowSize: learnWindow, minSamples: learnMinSamples, successWeight: learnSW, failureWeight: learnFW, cacheWeight: learnCW, costWeight: learnCostW },
+    churn: { enabled: churnEnabled, maxChurnTokens: churnMax },
   };
 }
 

@@ -7,7 +7,12 @@
  * - 粘滞（sticky）：同 taskType 连续轮次保持同一模型以保缓存
  * - 多跳转运：fallback 链共享同一 sessionId 前缀
  */
-import type { CacheRecord, NormalizedCacheConfig } from "../types.ts";
+import type { CacheRecord, NormalizedRouterConfig } from "../types.ts";
+
+/** 估算切换丢失的缓存 token（公共前缀字符 → token 粗估：~4 字符/token） */
+export function churnTokens(commonPrefixChars: number): number {
+  return Math.round(commonPrefixChars / 4);
+}
 
 function hashPrompt(text: string): string {
   // 轻量 hash：前 4K 字符的简单哈希，避免大文本开销
@@ -33,6 +38,14 @@ export class CacheManager {
   trackPrompt(sessionId: string, promptText: string): void {
     if (!sessionId) return;
     this.lastPromptBySession.set(sessionId, promptText);
+  }
+
+  /** compaction 后重置前缀：旧前缀不再有效，清空 lastPrompt 并将 commonPrefixChars 降 0 */
+  invalidatePrefix(): void {
+    this.lastPromptBySession.clear();
+    for (const rec of this.records.values()) {
+      rec.commonPrefixChars = 0;
+    }
   }
 
   /** 回填 usage 后的缓存统计 */
@@ -78,7 +91,7 @@ export class CacheManager {
   }
 
   /** 在候选集中按缓存偏好排序（不改变优先级，仅在同优先级或 fallback 时生效） */
-  rankCandidates(candidates: string[], sessionId: string, promptText: string, config: NormalizedCacheConfig): string[] {
+  rankCandidates(candidates: string[], sessionId: string, promptText: string, config: NormalizedRouterConfig): string[] {
     if (!config.cache.enabled || !config.cache.preferCache || candidates.length <= 1) return candidates;
     const scored = candidates.map((sel) => {
       const est = this.estimate(sel, sessionId, promptText);
@@ -95,7 +108,7 @@ export class CacheManager {
   }
 
   /** 粘滞：同 taskType 在 TTL 内优先保持 */
-  stickyPreferred(currentTaskType: string, config: NormalizedCacheConfig): string | undefined {
+  stickyPreferred(currentTaskType: string, config: NormalizedRouterConfig): string | undefined {
     if (!config.cache.enabled || !config.cache.sticky || !this.lastDecision) return undefined;
     if (this.lastDecision.taskType !== currentTaskType) return undefined;
     if (Date.now() - this.lastDecision.at > config.cache.stickyTtlMs) return undefined;

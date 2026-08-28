@@ -35,6 +35,9 @@ function cfg(overrides: Partial<NormalizedRouterConfig> = {}): NormalizedRouterC
     fallback: { mode: "off" },
     explicitModelPrefix: "@model:",
     verbose: false,
+    cache: { enabled: true, preferCache: true, minHitChars: 1024, sticky: true, stickyTtlMs: 300000 },
+    learn: { enabled: false, windowSize: 50, minSamples: 2, successWeight: 1.0, failureWeight: -2.0, cacheWeight: 0.0005, costWeight: -0.0001 },
+    churn: { enabled: false, maxChurnTokens: 8000 },
     ...overrides,
   };
 }

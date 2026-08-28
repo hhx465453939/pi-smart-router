@@ -84,6 +84,55 @@ export interface CacheRecord {
   updatedAt: number;
 }
 
+/** 学习配置 */
+export interface LearnConfig {
+  enabled?: boolean;
+  windowSize?: number;
+  minSamples?: number;
+  successWeight?: number;
+  failureWeight?: number;
+  cacheWeight?: number;
+  costWeight?: number;
+}
+
+export interface NormalizedLearnConfig {
+  enabled: boolean;
+  windowSize: number;
+  minSamples: number;
+  successWeight: number;
+  failureWeight: number;
+  cacheWeight: number;
+  costWeight: number;
+}
+
+/** 切换抖动（churn）配置 */
+export interface ChurnConfig {
+  enabled?: boolean;
+  maxChurnTokens?: number;
+}
+
+export interface NormalizedChurnConfig {
+  enabled: boolean;
+  maxChurnTokens: number;
+}
+
+/** 学习结果记录 */
+export interface LearnOutcome {
+  taskType: string;
+  selector: string;
+  cost: number;
+  cacheRead: number;
+  success: boolean;
+  timestamp: number;
+}
+
+/** 学习得分条目 */
+export interface LearnScore {
+  selector: string;
+  score: number;
+  samples: number;
+}
+
 /** 路由规则 */
 export interface RouterRule {
   id: string;
@@ -152,6 +201,8 @@ export interface DecisionRecord extends RouteDecision {
 /** 完整配置（pi-router.json） */
 export interface RouterConfig {
   cache?: CacheConfig;
+  learn?: LearnConfig;
+  churn?: ChurnConfig;
   enabled?: boolean;
   defaultModel?: string;
   /** turn | request | both */
@@ -171,6 +222,8 @@ export interface RouterConfig {
 /** 归一化后的配置（默认值已填充） */
 export interface NormalizedRouterConfig {
   cache: NormalizedCacheConfig;
+  learn: NormalizedLearnConfig;
+  churn: NormalizedChurnConfig;
   enabled: boolean;
   defaultModel: string | undefined;
   routingLevel: "turn" | "request" | "both";
