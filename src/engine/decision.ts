@@ -4,10 +4,11 @@
  * 优先级：显式指定 > 冷却规避 > 规则 > defaultModel > 保持当前
  * 提炼自 CCR 的多策略优先级 + fallback 链。
  */
-import type { NormalizedRouterConfig, RouteDecision, TaskFeatures } from "../types.ts";
+import type { NormalizedRouterConfig, RouteDecision, TaskFeatures, RouterRule } from "../types.ts";
 import { CooldownSet } from "./registry.ts";
 import { pickAvailableModel, createExecutionPlan } from "./planner.ts";
-import { type CompiledRule, matchFirstRule } from "./rules.ts";
+import { type CompiledRule } from "./rules.ts";
+import { evaluateCondition } from "./conditions.ts";
 import type { CacheManager } from "./cache.ts";
 import type { LearningManager } from "./learn.ts";
 import type { SelfLearnManager } from "./selflearn.ts";
@@ -73,11 +74,16 @@ function estimateChurn(
 }
 
 export function decide(input: DecisionInput): RouteDecision {
-  const { features, config, compiledRules, cooldowns, availableModels, cacheManager, learning, selfLearn, probe, sessionId, promptText } = input;
+  const { features, config, compiledRules, cooldowns, cacheManager, learning, selfLearn, probe, sessionId, promptText } = input;
   const now = Date.now();
   const prompt = promptText ?? features.promptText ?? "";
   const sid = sessionId ?? "";
   const current = features.currentModel;
+  // 模型池硬边界（config.pool）：池非空时，全部决策（规则/learn/sticky/default/fallback）只在池内选
+  const poolSet = config.pool && config.pool.length > 0 ? new Set(config.pool.map((s) => s.toLowerCase())) : undefined;
+  const availableModels = poolSet
+    ? new Set([...input.availableModels].filter((s) => poolSet.has(s.toLowerCase())))
+    : input.availableModels;
 
   /** 决策时如果目标 ≠ 当前且 churn 超阈值，在 reason 标注；规则仍优先，非规则层则倾向保持 */
   const churnNote = (target: string): string => {
@@ -91,10 +97,10 @@ export function decide(input: DecisionInput): RouteDecision {
     return loss > config.churn.maxChurnTokens;
   };
 
-  // 1. 显式指定：强制，不做冷却规避与规则
+  // 1. 显式指定：强制，不做冷却规避、不受模型池限制（用户手动意志高于自动路由边界）
   if (features.explicitModel) {
     const sel = features.explicitModel.trim();
-    if (isAvailable(sel, availableModels)) {
+    if (isAvailable(sel, input.availableModels)) {
       return { selector: sel, reason: `explicit @${config.explicitModelPrefix}${sel}`, ruleId: undefined, source: "explicit", timestamp: now };
     }
     return { selector: undefined, reason: `explicit model "${sel}" not available`, ruleId: undefined, source: "explicit", timestamp: now };
@@ -109,8 +115,15 @@ export function decide(input: DecisionInput): RouteDecision {
     }
   }
 
-  // 2. 规则命中
-  const matched = matchFirstRule(compiledRules, features);
+  // 2. 规则命中（池感知：目标模型在池外的规则被跳过，继续找下一条可用的）
+  const poolAllows = (sel: string): boolean => !poolSet || poolSet.has(sel.toLowerCase());
+  let matched: RouterRule | undefined;
+  for (const entry of compiledRules) {
+    if (!entry.active) continue;
+    try {
+      if (evaluateCondition(entry.rule.when, features) && poolAllows(entry.rule.model.trim())) { matched = entry.rule; break; }
+    } catch { /* 条件异常视为不命中 */ }
+  }
   if (matched) {
     const desired = matched.model.trim();
     const isCacheAware = matched.cacheAware !== false;

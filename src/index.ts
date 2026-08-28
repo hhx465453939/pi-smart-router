@@ -8,7 +8,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { DecisionRecord, NormalizedRouterConfig } from "./types.ts";
-import { loadConfig, createConfigWatcher, persistEnabled, type ConfigWatcher } from "./config.ts";
+import { loadConfig, createConfigWatcher, persistEnabled, persistPool, filterByPool, type ConfigWatcher } from "./config.ts";
 import { CooldownSet } from "./engine/registry.ts";
 import { CacheManager } from "./engine/cache.ts";
 import { LearningManager } from "./engine/learn.ts";
@@ -17,6 +17,7 @@ import { resolveTurnDecision } from "./hooks/agent.ts";
 import { resolveProviderDecision } from "./hooks/provider.ts";
 import { onProviderResponse, onToolResult, isQuotaExceeded } from "./hooks/failure.ts";
 import { formatRules, formatStatus } from "./commands/router.ts";
+import { PoolPickerComponent, type PoolItem, type PickerTheme } from "./tui/multipick.ts";
 import { buildRouterTool } from "./tool/router.ts";
 import { classifyTaskType } from "./context/task.ts";
 import { ModelCatalog } from "./catalog/catalog.ts";
@@ -85,6 +86,11 @@ export default function (pi: ExtensionAPI) {
     return s;
   }
 
+  /** 当前生效的模型池（热加载后） */
+  function cfgPool(ctx: ExtensionContext): string[] {
+    return (watcher?.get() ?? loadConfig(ctx.cwd)).pool ?? [];
+  }
+
   /** 从 modelRegistry 提取目录信息（seed catalog + 探测目标） */
   function registryInfos(ctx: ExtensionContext): Array<{ selector: string; provider: string; baseUrl?: string; contextWindow?: number; cost?: { input: number; output: number; cacheRead: number }; input?: string[] }> {
     const out: Array<{ selector: string; provider: string; baseUrl?: string; contextWindow?: number; cost?: { input: number; output: number; cacheRead: number }; input?: string[] }> = [];
@@ -132,7 +138,8 @@ export default function (pi: ExtensionAPI) {
   }
   async function tryImmediateFallback(failedSelector: string, ctx: ExtensionContext, reason: string): Promise<boolean> {
     const cfg = watcher?.get() ?? loadConfig(ctx.cwd);
-    const available = availableSelectors(ctx);
+    // 模型池硬边界：秒切候选只在池内
+    const available = new Set(filterByPool(availableSelectors(ctx), cfg.pool));
     const filtered = probe ? new Set(probe.filterAvailable([...available])) : available;
     // 已排除失败者，候选为 filtered 中未冷却的
     const candidates = [...filtered].filter((s) => !cooldowns.isCooldown(s));
@@ -350,7 +357,7 @@ export default function (pi: ExtensionAPI) {
 
     turnIndex += 1;
     const cur = currentSelector(ctx);
-    const available = availableSelectors(ctx);
+    const available = new Set(filterByPool(availableSelectors(ctx), cfg.pool));
     const availableFiltered = probe ? new Set(probe.filterAvailable([...available])) : available;
     const sid = sessionIdOf(ctx);
     const promptText = (event as unknown as { prompt?: string }).prompt ?? "";
@@ -369,9 +376,11 @@ export default function (pi: ExtensionAPI) {
         const k = `${lastTaskType}×${difficulty}`;
         return rec.learnScore[k] ?? 0;
       });
-      // 并入前 8 名画像候选（与 available 求并集），不通的模型已在后台探测排除
+      // 并入前 8 名画像候选（与 available 求并集），不通的模型已在后台探测排除；模型池外不入候选
+      const poolOk = (sel: string): boolean => !cfg.pool?.length || cfg.pool.some((p) => p.toLowerCase() === sel.toLowerCase());
       for (const p of ranked.slice(0, 8)) {
         if (probe && probe.getAvailability(p.selector) === "unavailable") continue;
+        if (!poolOk(p.selector)) continue;
         availableFiltered.add(p.selector);
       }
     }
@@ -453,7 +462,7 @@ export default function (pi: ExtensionAPI) {
     if (!cfg.enabled || (cfg.routingLevel !== "request" && cfg.routingLevel !== "both")) return;
 
     const cur = currentSelector(ctx);
-    const available = availableSelectors(ctx);
+    const available = new Set(filterByPool(availableSelectors(ctx), cfg.pool));
     const sid = sessionIdOf(ctx);
     const res = resolveProviderDecision({
       payload: event.payload as Record<string, unknown>,
@@ -692,6 +701,34 @@ export default function (pi: ExtensionAPI) {
 
       if (cmd === "status" || cmd === "st" || cmd === "") {
         ctx.ui.notify(formatStatus(deps), "info");
+        return;
+      }
+      if (cmd === "pool") {
+        // 模型池多选器：搜索 + 空格勾选 + 回车保存到全局配置
+        const infos = registryInfos(ctx as unknown as ExtensionContext);
+        if (!infos.length) { ctx.ui.notify("router: 无可用模型（modelRegistry 为空）", "warning"); return; }
+        const items: PoolItem[] = infos.map((i) => ({ selector: i.selector, contextWindow: i.contextWindow, costInput: i.cost?.input }));
+        const cfgNow = watcher?.get() ?? loadConfig(ctx.cwd);
+        const initial = new Set((cfgNow.pool ?? []).map((s) => s.toLowerCase()));
+        const result = await (ctx.ui as unknown as { custom: <T>(fn: (tui: { requestRender: () => void }, theme: PickerTheme, kb: unknown, done: (v: T | null) => void) => { render: (w: number) => string[]; invalidate: () => void; handleInput: (d: string) => void }) => Promise<T | null> }).custom<string[] | null>((tui, theme, _kb, done) => {
+          const picker = new PoolPickerComponent(items, initial);
+          picker.onConfirm = (sel) => done(sel);
+          picker.onCancel = () => done(null);
+          return {
+            render: (w) => picker.render(w, theme),
+            invalidate: () => { /* 每次现算，无需缓存 */ },
+            handleInput: (d) => picker.handleInput(d, () => tui.requestRender()),
+          };
+        });
+        if (result === null) { ctx.ui.notify("router: pool 未修改（取消）", "info"); return; }
+        try {
+          persistPool(result);
+          if (watcher) watcher.reload();
+          const n = result.length;
+          ctx.ui.notify(n === 0 ? "router: pool 已清空（全部可用模型参与路由）" : `router: pool 已保存 ${n} 个模型到全局配置 ~/.pi/agent/pi-router.json`, "info");
+        } catch (e) {
+          ctx.ui.notify(`router: pool 保存失败 ${String(e).slice(0, 120)}`, "error");
+        }
         return;
       }
       if (cmd === "rules" || cmd === "r") {
@@ -937,7 +974,7 @@ export default function (pi: ExtensionAPI) {
       const target = params.target.trim();
       if (!target) return { content: [{ type: "text" as const, text: "Error: target model is required." }], details: { ok: false, error: "missing target" } };
 
-      const avail = availableSelectors(ctx as unknown as ExtensionContext);
+      const avail = new Set(filterByPool(availableSelectors(ctx as unknown as ExtensionContext), cfgPool(ctx)));
       const targetInAvail = [...avail].some((s) => s.toLowerCase() === target.toLowerCase());
       if (!targetInAvail) {
         const msg = `Cannot hand off to "${target}": not in available models or marked unavailable.`;

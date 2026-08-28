@@ -57,6 +57,24 @@ pi 通过 `sessionId` 前缀缓存（Anthropic `cache_control` / OpenAI `prompt_
 
 详见 `tasks/CHG-003/SPEC.md` 的 ADR-009~013。
 
+### v0.5.0：模型池（Model Pool）— 自动路由的硬边界
+
+> **60+ 个可用模型太多，自动路由在你不认识的角落选模型不可控？先选一个可信池。**
+
+- **`/router pool` 交互多选器**：搜索（子串、大小写不敏感、支持中文）+ ↑↓ 移动 + **空格勾选** + **回车保存**到全局配置 `~/.pi/agent/pi-router.json`，esc 取消
+- **硬边界语义**：池非空时，**所有自动决策（规则/难度 rank/self-learn/粘滞/default/fallback/秒切）只在池内选**；池外模型即使规则命中也被跳过（继续匹配下一条可用规则）
+  - 例：选池 `[opencode-go/deepseek-v4-flash, zai-coding-cn/glm-5.3, shudie/deepseek-v4-flash]` 后，`huge-context` 规则指向的 `volces/...` 不再被切（不在池内），fallback 自动改选池内 1M 窗口的同类
+- **显式指定不受限**：`@model:xxx` 手动指定仍是最高优先级（用户意志高于池），池只约束自动路由
+- **空池 = 不过滤**：清空勾选并回车，恢复“全部可用模型参与路由”
+- 兼容 auto-profiling：rank 只在池内执行，候选数大幅收敛，决策更快更可解释
+
+```bash
+/router pool          # 打开多选器：搜索 + 空格勾选 + 回车保存
+/router status        # 状态行显示当前 pool
+```
+
+> 💡 适合的信赖池：每个任务类型保留 1-2 个“主力”，加 1 个兜底快模型，总数 5-10 个即可覆盖全部规则。
+
 ## 为什么
 
 pi 自带的模型切换是手动的（`/model`、`Ctrl+P`）。当你配置了多个模型（coding / 通用 / 多模态 / 长上下文）时，需要一个智能调度层自动选择。

@@ -42,6 +42,7 @@ function cfg(overrides: Partial<NormalizedRouterConfig> = {}): NormalizedRouterC
     difficulty: { enabled: false, lowThreshold: 40, highThreshold: 120 },
     selfLearn: { enabled: false, minSamples: 3, decay: 0.9, successWeight: 1.0, failureWeight: -2.0, costWeight: -0.0001 },
     probe: { enabled: false, timeoutMs: 300000, probeOnStart: false, excludeUnavailable: true },
+    pool: [],
     ...overrides,
   };
 }
@@ -106,5 +107,55 @@ describe("decide", () => {
     const d = decide({ features: feat(), config: c, compiledRules: compiled, cooldowns: new CooldownSet(), availableModels: new Set() });
     assert.equal(d.source, "keep");
     assert.equal(d.selector, undefined);
+  });
+});
+
+describe("model pool (hard boundary)", () => {
+  const avail = new Set(["volces/a", "opencode/b", "zai/c"]);
+
+  it("pool empty → no filtering, rule hits normally", () => {
+    const rules = compileRules([{ id: "r1", name: "n", priority: 100, when: { taskType: "code" }, model: "volces/a" }]).compiled;
+    const d = decide({ features: feat(), config: cfg(), compiledRules: rules, cooldowns: new CooldownSet(), availableModels: avail });
+    assert.equal(d.selector, "volces/a");
+  });
+
+  it("rule target outside pool → rule skipped, next matching rule wins", () => {
+    const rules = compileRules([
+      { id: "high", name: "n1", priority: 110, when: { taskType: "code" }, model: "volces/a" },
+      { id: "low", name: "n2", priority: 90, when: { taskType: "code" }, model: "opencode/b" },
+    ]).compiled;
+    const d = decide({ features: feat(), config: cfg({ pool: ["opencode/b", "zai/c"] }), compiledRules: rules, cooldowns: new CooldownSet(), availableModels: avail });
+    assert.equal(d.selector, "opencode/b");
+    assert.equal(d.ruleId, "low");
+  });
+
+  it("all rule targets outside pool → falls through to default (if in pool)", () => {
+    const rules = compileRules([{ id: "r1", name: "n", priority: 100, when: { taskType: "code" }, model: "volces/a" }]).compiled;
+    const d = decide({ features: feat(), config: cfg({ pool: ["zai/c"], defaultModel: "zai/c" }), compiledRules: rules, cooldowns: new CooldownSet(), availableModels: avail });
+    assert.equal(d.selector, "zai/c");
+    assert.equal(d.source, "default");
+  });
+
+  it("default outside pool → fallback chain picks first pooled model", () => {
+    const d = decide({
+      features: feat(),
+      config: cfg({ pool: ["opencode/b"], defaultModel: "volces/a", fallback: { mode: "model-chain", models: ["volces/a", "opencode/b"] } }),
+      compiledRules: [],
+      cooldowns: new CooldownSet(),
+      availableModels: avail,
+    });
+    assert.equal(d.selector, "opencode/b");
+  });
+
+  it("pool matching is case-insensitive", () => {
+    const rules = compileRules([{ id: "r1", name: "n", priority: 100, when: { taskType: "code" }, model: "Volces/A" }]).compiled;
+    const d = decide({ features: feat(), config: cfg({ pool: ["volces/a"] }), compiledRules: rules, cooldowns: new CooldownSet(), availableModels: avail });
+    assert.equal(d.selector, "Volces/A");
+  });
+
+  it("explicit model bypasses pool (user force)", () => {
+    const d = decide({ features: feat({ explicitModel: "volces/a" }), config: cfg({ pool: ["opencode/b"] }), compiledRules: [], cooldowns: new CooldownSet(), availableModels: avail });
+    assert.equal(d.selector, "volces/a");
+    assert.equal(d.source, "explicit");
   });
 });

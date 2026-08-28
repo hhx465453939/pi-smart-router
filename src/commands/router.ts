@@ -36,6 +36,8 @@ export function formatStatus(deps: RouterCommandDeps): string {
   lines.push(`current: ${deps.getCurrentModel() ?? "(none)"}`);
   lines.push(`available: ${deps.getAvailableModels().join(", ") || "(none)"}`);
   lines.push(`rules: ${cfg.rules.length}  fallback: ${cfg.fallback?.mode ?? "off"}${cfg.fallback?.models?.length ? ` → ${cfg.fallback.models.join(", ")}` : ""}`);
+  const pool = (cfg as unknown as { pool?: string[] }).pool;
+  lines.push(`pool: ${!pool?.length ? "(全部可用模型)" : `${pool.length} 个 → ${pool.join(", ")}`}`);
   const cds = deps.cooldowns.all();
   if (cds.length) {
     lines.push(`cooldowns (${cds.length}):`);

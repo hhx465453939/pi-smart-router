@@ -75,8 +75,10 @@ export function normalizeConfig(raw: RouterConfig | undefined): NormalizedRouter
   const probeTimeout = Number.isFinite(r.probe?.timeoutMs as number) ? Math.max(1000, Math.trunc(r.probe!.timeoutMs as number)) : 300000;
   const probeOnStart = r.probe?.probeOnStart !== false;
   const probeExclude = r.probe?.excludeUnavailable !== false;
+  const pool = Array.isArray(r.pool) ? [...new Set(r.pool.filter((s): s is string => typeof s === "string" && s.trim() !== "").map((s) => s.trim()))] : [];
   return {
     enabled: r.enabled !== false,
+    pool,
     defaultModel: typeof r.defaultModel === "string" ? r.defaultModel.trim() || undefined : undefined,
     routingLevel,
     cooldownMs,
@@ -137,4 +139,26 @@ export function persistEnabled(cwd: string, enabled: boolean): void {
     mkdirSync(dirname(targetPath), { recursive: true });
     writeFileSync(targetPath, JSON.stringify(raw, null, 2) + "\n", "utf8");
   } catch { /* 忽略写入失败 */ }
+}
+
+/** 持久化模型池（固定写入全局 ~/.pi/agent/pi-router.json，pi 全局生效） */
+export function persistPool(pool: string[]): void {
+  const targetPath = globalConfigPath();
+  let raw: Record<string, unknown> = {};
+  if (existsSync(targetPath)) {
+    try { raw = JSON.parse(readFileSync(targetPath, "utf8")) as Record<string, unknown>; } catch { raw = {}; }
+  }
+  raw.pool = pool;
+  try {
+    mkdirSync(dirname(targetPath), { recursive: true });
+    writeFileSync(targetPath, JSON.stringify(raw, null, 2) + "\n", "utf8");
+  } catch { /* 忽略写入失败 */ }
+}
+
+/** 池过滤：pool 空 → 返回全部选择器（原样）；否则只保留池内（大小写不敏感） */
+export function filterByPool<T extends string>(selectors: Iterable<T>, pool: string[]): T[] {
+  const arr = [...selectors];
+  if (!pool || pool.length === 0) return arr;
+  const pset = new Set(pool.map((s) => s.toLowerCase()));
+  return arr.filter((s) => pset.has(s.toLowerCase()));
 }

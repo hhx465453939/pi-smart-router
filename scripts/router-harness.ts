@@ -195,6 +195,11 @@ async function main() {
   const scenario = process.argv[2] ?? "quota-rule-loop";
   console.log(`=== Router Harness | scenario=${scenario} ===\n`);
 
+  if (scenario === "pool-boundary") {
+    FAKE_CONFIG.pool = ["opencode/deepseek-v4-flash", "zai/glm-5.3", "shudie/deepseek-v4-flash-0731"];
+    console.log("    pool-boundary: 已启用模型池 → " + FAKE_CONFIG.pool.join(", "));
+  }
+
   const harness = new Harness();
   const factory = (await import("../src/index.ts")).default;
   const api = harness.buildApi();
@@ -206,10 +211,14 @@ async function main() {
   // 但 config.ts 用 homedir + ~/.pi/agent/pi-router.json；harness 里 cwd=/tmp，让 config 读 /tmp/.pi/pi-router.json
   // 先写一份 fake 配置到 harness cwd
   const fs = await import("node:fs");
+  // 配置写入与 FakeCtx.cwd 匹配的路径（/tmp/router-harness/.pi/pi-router.json），使 watcher 真正读到 FAKE_CONFIG
+  const harnessCwd = "/tmp/router-harness";
+  fs.mkdirSync(harnessCwd + "/.pi", { recursive: true });
+  fs.writeFileSync(harnessCwd + "/.pi/pi-router.json", JSON.stringify(FAKE_CONFIG, null, 2));
+  // 同时写一份到 HOME（global 路径），双保险
   const harnessDir = "/tmp/router-harness-home";
-  fs.mkdirSync(harnessDir + "/.pi", { recursive: true });
-  fs.writeFileSync(harnessDir + "/.pi/pi-router.json", JSON.stringify(FAKE_CONFIG, null, 2));
   fs.mkdirSync(harnessDir + "/.pi/agent", { recursive: true });
+  fs.writeFileSync(harnessDir + "/.pi/agent/pi-router.json", JSON.stringify(FAKE_CONFIG, null, 2));
   // 改 HOME 让 config 找 harness cwd
   process.env.HOME = harnessDir;
   process.env.USERPROFILE = harnessDir;
