@@ -116,18 +116,20 @@ export default function (pi: ExtensionAPI) {
   }
 
   /** auto-profiling：遍历全部已注册模型，生成画像（含未在 available 的） */
-  function registryProfiles(ctx: ExtensionContext): ModelProfile[] {
-    const out: ModelProfile[] = [];
+  function registryProfiles(ctx: ExtensionContext): { profiles: ModelProfile[]; targets: Array<{ selector: string; provider: string; baseUrl?: string }> } {
+    const profiles: ModelProfile[] = [];
+    const targets: Array<{ selector: string; provider: string; baseUrl?: string }> = [];
     try {
       const reg: unknown = (ctx as unknown as Record<string, unknown>).modelRegistry;
       const r = reg as { getAll?: () => RegistryModel[] };
       const all = r.getAll?.() ?? [];
       for (const m of all) {
         if (!m?.provider || !m?.id) continue;
-        out.push(profileModel(m));
+        profiles.push(profileModel(m));
+        targets.push({ selector: `${m.provider}/${m.id}`, provider: m.provider, baseUrl: (m as unknown as Record<string, unknown>).baseUrl as string | undefined });
       }
     } catch { /* ignore */ }
-    return out;
+    return { profiles, targets };
   }
 
   function contextTokens(ctx: ExtensionContext): number | undefined {
@@ -175,17 +177,18 @@ export default function (pi: ExtensionAPI) {
       const regInfos = registryInfos(ctx);
       catalog.ensureSeed(regInfos);
       selfLearn = new SelfLearnManager(catalog, cfg.selfLearn);
-      // auto-profiling：遍历全部已注册模型生成画像（含未 available 的）
-      profiles = registryProfiles(ctx);
-      // 初始化可用性探测 + 启动后台异步探测（不阻塞）
+      // auto-profiling：遍历全部已注册模型生成画像（含未 available 的），顺手采集连通性探测目标
+      const { profiles: allProfiles, targets: allTargets } = registryProfiles(ctx);
+      profiles = allProfiles;
+      // 初始化可用性探测 + 启动后台异步探测（不阻塞，按 provider 去重，覆盖全量模型）
       probe = new AvailabilityProbe({
         config: cfg.probe,
         getBaseUrl: (provider) => providerBaseUrl(ctx, provider),
         log: (m) => { if (cfg.verbose) console.log(m); },
       });
-      probe.start(regInfos.map((r) => ({ selector: r.selector, provider: r.provider, baseUrl: r.baseUrl })), (snap) => {
+      probe.startByProvider(allTargets, (snap) => {
         const bad = Object.entries(snap).filter(([, v]) => v === "unavailable").map(([k]) => k);
-        if (bad.length && cfg.verbose) console.log(`[probe] done: ${bad.length} unavailable: ${bad.join(", ")}`);
+        if (bad.length && cfg.verbose) console.log(`[probe] done: ${bad.length} unreachable models excluded: ${bad.slice(0, 8).join(", ")}...`);
       });
       try {
         const entries = (ctx.sessionManager as unknown as { getEntries?: () => Array<{ type: string; customType?: string; data?: unknown }> }).getEntries?.() ?? [];
@@ -245,8 +248,11 @@ export default function (pi: ExtensionAPI) {
         const k = `${lastTaskType}×${difficulty}`;
         return rec.learnScore[k] ?? 0;
       });
-      // 并入前 8 名画像候选（与 available 求并集）
-      for (const p of ranked.slice(0, 8)) availableFiltered.add(p.selector);
+      // 并入前 8 名画像候选（与 available 求并集），不通的模型已在后台探测排除
+      for (const p of ranked.slice(0, 8)) {
+        if (probe && probe.getAvailability(p.selector) === "unavailable") continue;
+        availableFiltered.add(p.selector);
+      }
     }
 
     const rec = resolveTurnDecision({

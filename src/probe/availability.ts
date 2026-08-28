@@ -74,6 +74,43 @@ export class AvailabilityProbe {
     })();
   }
 
+  /**
+   * 按 provider 去重探测（auto-profiling 拉取全量模型时调用）：
+   * 同一 provider 端点探测一次，结果广播到其下所有模型 selector，不通的 provider 全部模型标 unavailable。
+   * 供“拉取全部已注册模型时顺手检测连通性、不通的不纳入 rank”使用。
+   */
+  startByProvider(targets: ProbeTarget[], onUpdate?: (snapshot: ProbeSnapshot) => void): void {
+    const cfg = this.deps.config;
+    if (!cfg.enabled || !cfg.probeOnStart || this.running) return;
+    if (targets.length === 0) return;
+    this.running = true;
+    const deadline = Date.now() + cfg.timeoutMs;
+    // 按 provider 分组
+    const byProvider = new Map<string, ProbeTarget[]>();
+    for (const t of targets) {
+      const list = byProvider.get(t.provider) ?? [];
+      list.push(t);
+      byProvider.set(t.provider, list);
+    }
+    void (async () => {
+      const tasks = [...byProvider.entries()].map(async ([provider, models]) => {
+        if (Date.now() > deadline) {
+          for (const t of models) this.snapshot[t.selector] = "uncertain";
+          return;
+        }
+        const base = this.deps.getBaseUrl(provider);
+        const reachable = await probeReachability(base ?? "", Math.min(cfg.timeoutMs, 30000));
+        for (const t of models) {
+          this.snapshot[t.selector] = reachable ? "available" : "unavailable";
+          if (!reachable) this.deps.log?.(`[probe] ${provider} unreachable → ${t.selector} excluded`);
+        }
+      });
+      await Promise.all(tasks);
+      this.running = false;
+      onUpdate?.(this.snapshot);
+    })();
+  }
+
   /** 真实调用后标记确定性不可用（401/402/403） */
   markAuthFailure(selector: string): void {
     this.snapshot[selector] = "unavailable";
