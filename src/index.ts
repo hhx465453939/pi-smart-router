@@ -17,7 +17,7 @@ import { resolveTurnDecision } from "./hooks/agent.ts";
 import { resolveProviderDecision } from "./hooks/provider.ts";
 import { onProviderResponse, onToolResult, isQuotaExceeded } from "./hooks/failure.ts";
 import { formatRules, formatStatus } from "./commands/router.ts";
-import { PoolPickerComponent, NamePromptComponent, PresetPickerComponent, type PoolItem, type PickerTheme } from "./tui/multipick.ts";
+import { PoolPickerComponent, NamePromptComponent, PresetPickerComponent, PresetManagerComponent, type PresetManagerAction, type PoolItem, type PresetItem, type PickerTheme } from "./tui/multipick.ts";
 import { buildRouterTool } from "./tool/router.ts";
 import { classifyTaskType } from "./context/task.ts";
 import { ModelCatalog } from "./catalog/catalog.ts";
@@ -676,7 +676,7 @@ export default function (pi: ExtensionAPI) {
 
   // ——— /router 命令 ———
   pi.registerCommand("router", {
-    description: "pi-smart-router: status / rules / reload / clear-cooldown / toggle / test / cache / learn / pool [use|save|rename|list|rm]",
+    description: "pi-smart-router: status / rules / reload / clear-cooldown / toggle / test / cache / learn / pool [回车=选中管理 | use|save|rename|list|rm]",
     handler: async (args, ctx) => {
       const raw = String(args ?? "").trim();
       const [sub, ...rest] = raw.split(/\s+/).filter(Boolean);
@@ -782,56 +782,125 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify(`⚡ router: 已切换到预设 "${picked.name}"（${picked.models.length} 模型）`, "info");
           return;
         }
-        // 主流程：模型池多选器（搜索 + 空格勾选 + 回车保存到全局配置）
-        const infos = registryInfos(ctx as unknown as ExtensionContext);
-        // 兑底：registry 元信息拿不到时，用 availableSelectors 字符串构造基础条目（无窗口/价格但可挑选）
-        if (!infos.length) {
-          const sels = [...availableSelectors(ctx as unknown as ExtensionContext)];
-          if (!sels.length) { ctx.ui.notify("router: 无可用模型（modelRegistry 为空）", "warning"); return; }
-          for (const s of sels) infos.push({ selector: s, provider: s.split("/")[0] ?? "" });
-        }
-        const items: PoolItem[] = infos.map((i) => ({ selector: i.selector, contextWindow: i.contextWindow, costInput: i.cost?.input }));
-        const cfgNow = watcher?.get() ?? loadConfig(ctx.cwd);
-        const initial = new Set((cfgNow.pool ?? []).map((s) => s.toLowerCase()));
-        const presetItems = presetList();
-        const result = await (ctx.ui as unknown as { custom: <T>(fn: (tui: { requestRender: () => void }, theme: PickerTheme, kb: unknown, done: (v: T | null) => void) => { render: (w: number) => string[]; invalidate: () => void; handleInput: (d: string) => void }) => Promise<T | null> }).custom<string[] | null>((tui, theme, _kb, done) => {
-          const picker = new PoolPickerComponent(items, initial);
-          picker.onConfirm = (sel) => done(sel);
-          picker.onCancel = () => done(null);
-          return {
-            render: (w) => picker.render(w, theme, presetItems),
-            invalidate: () => { /* 每次现算，无需缓存 */ },
-            handleInput: (d) => picker.handleInput(d, () => tui.requestRender()),
-          };
-        });
-        if (result === null) { ctx.ui.notify("router: pool 未修改（取消）", "info"); return; }
-        try {
-          persistPool(result);
-          if (watcher) watcher.reload();
-          const n = result.length;
-          ctx.ui.notify(n === 0 ? "router: pool 已清空（全部可用模型参与路由）" : `router: pool 已保存 ${n} 个模型到全局配置 ~/.pi/agent/pi-router.json`, "info");
-        } catch (e) {
-          ctx.ui.notify(`router: pool 保存失败 ${String(e).slice(0, 120)}`, "error");
-        }
-        // 非空池 → 弹命名框（可存为预设，esc 跳过）
-        if (result.length > 0) {
-          try {
-            const name = await (ctx.ui as unknown as { custom: <T>(fn: (tui: { requestRender: () => void }, theme: PickerTheme, kb: unknown, done: (v: T | null) => void) => { render: (w: number) => string[]; invalidate: () => void; handleInput: (d: string) => void }) => Promise<T | null> }).custom<string | null>((tui, theme, _kb, done) => {
-              const np = new NamePromptComponent("保存为预设？输入名称");
-              np.onConfirm = (v) => done(v);
-              np.onCancel = () => done(null);
-              return {
-                render: (w) => np.render(w, theme),
-                invalidate: () => {},
-                handleInput: (d) => np.handleInput(d, () => tui.requestRender()),
-              };
-            });
-            if (name) {
-              persistPoolPreset(name, result);
+        // 主流程（无子命令）：预设管理面板 — 展示预设 + 当前池，↑↓选中，键位操作
+        const uiCustom = ctx.ui as unknown as { custom: <T>(fn: (tui: { requestRender: () => void }, theme: PickerTheme, kb: unknown, done: (v: T | null) => void) => { render: (w: number) => string[]; invalidate: () => void; handleInput: (d: string) => void }) => Promise<T | null> };
+        const nowCfg = watcher?.get() ?? loadConfig(ctx.cwd);
+        let presets = presetList();
+        let activeModels = [...(nowCfg.pool ?? [])];
+
+        // 模型多选器（create 复用当前池预勾选，edit 复用该预设模型预勾选）
+        const openModelPicker = async (initialChecked: string[]): Promise<string[] | null> => {
+          const infos = registryInfos(ctx as unknown as ExtensionContext);
+          if (!infos.length) {
+            const sels = [...availableSelectors(ctx as unknown as ExtensionContext)];
+            if (!sels.length) { ctx.ui.notify("router: 无可用模型（modelRegistry 为空）", "warning"); return null; }
+            for (const s of sels) infos.push({ selector: s, provider: s.split("/")[0] ?? "" });
+          }
+          const items: PoolItem[] = infos.map((i) => ({ selector: i.selector, contextWindow: i.contextWindow, costInput: i.cost?.input }));
+          const initial = new Set(initialChecked.map((s) => s.toLowerCase()));
+          return await uiCustom.custom<string[] | null>((tui, theme, _kb, done) => {
+            const picker = new PoolPickerComponent(items, initial);
+            picker.onConfirm = (sel) => done(sel);
+            picker.onCancel = () => done(null);
+            return {
+              render: (w) => picker.render(w, theme, presetList()),
+              invalidate: () => { /* 每次现算，无需缓存 */ },
+              handleInput: (d) => picker.handleInput(d, () => tui.requestRender()),
+            };
+          });
+        };
+
+        // 命名弹窗（create 存预设 / edit 后命名 复用；rename 用 initialText 预填旧名）
+        const openNamePrompt = async (hint: string, initialText = ""): Promise<string | null> => {
+          return await uiCustom.custom<string | null>((tui, theme, _kb, done) => {
+            const np = new NamePromptComponent(hint, initialText);
+            np.onConfirm = (v) => done(v);
+            np.onCancel = () => done(null);
+            return {
+              render: (w) => np.render(w, theme),
+              invalidate: () => {},
+              handleInput: (d) => np.handleInput(d, () => tui.requestRender()),
+            };
+          });
+        };
+
+        const mgr = new PresetManagerComponent(presets, activeModels);
+        while (true) {
+          const act = await uiCustom.custom<PresetManagerAction | null>((tui, theme, _kb, done) => {
+            mgr.onAction = (a) => done(a);
+            mgr.onCancel = () => done(null);
+            return {
+              render: (w) => mgr.render(w, theme),
+              invalidate: () => {},
+              handleInput: (d) => mgr.handleInput(d, () => tui.requestRender()),
+            };
+          });
+          if (act === null) { ctx.ui.notify("router: 已退出预设管理", "info"); return; }
+
+          switch (act.type) {
+            case "activate": {
+              const models = applyPoolPreset(act.item.name);
               if (watcher) watcher.reload();
-              ctx.ui.notify(`router: 预设 "${name}" 已保存（${result.length} 模型）— /router pool use ${name} 快速切换`, "info");
+              if (!models) { ctx.ui.notify(`router: 预设 "${act.item.name}" 激活失败（可能已失效）`, "warning"); presets = presetList(); break; }
+              ctx.ui.notify(`⚡ router: 已切换到预设 "${act.item.name}"（${models.length} 模型）`, "info");
+              return;
             }
-          } catch { /* 命名弹窗失败不影响池激活 */ }
+            case "edit": {
+              const sel = await openModelPicker(act.item.models);
+              if (sel === null) { ctx.ui.notify("router: 编辑取消，未修改", "info"); break; }
+              try {
+                persistPoolPreset(act.item.name, sel);
+                if (watcher) watcher.reload();
+                ctx.ui.notify(`router: 预设 "${act.item.name}" 模型已更新为 ${sel.length} 个`, "info");
+              } catch (e) { ctx.ui.notify(`router: 预设保存失败 ${String(e).slice(0, 120)}`, "error"); }
+              presets = presetList();
+              activeModels = [...((watcher?.get() ?? loadConfig(ctx.cwd)).pool ?? [])];
+              mgr.update(presets, activeModels);
+              break;
+            }
+            case "rename": {
+              const newName = await openNamePrompt("重命名预设？输入新名称", act.item.name);
+              if (newName && newName !== act.item.name) {
+                const ok = renamePoolPreset(act.item.name, newName);
+                if (watcher) watcher.reload();
+                ctx.ui.notify(ok ? `router: 预设 "${act.item.name}" 已重命名为 "${newName}"` : `router: 预设 "${act.item.name}" 不存在`, ok ? "info" : "warning");
+              }
+              presets = presetList();
+              mgr.update(presets, activeModels);
+              break;
+            }
+            case "delete": {
+              const ok = removePoolPreset(act.name);
+              if (watcher) watcher.reload();
+              ctx.ui.notify(ok ? `router: 预设 "${act.name}" 已删除` : `router: 预设 "${act.name}" 不存在`, ok ? "info" : "warning");
+              presets = presetList();
+              mgr.update(presets, activeModels);
+              break;
+            }
+            case "create": {
+              const sel = await openModelPicker(activeModels);
+              if (sel === null) { ctx.ui.notify("router: 新建取消，未修改", "info"); break; }
+              try {
+                persistPool(sel);
+                if (watcher) watcher.reload();
+                const n = sel.length;
+                ctx.ui.notify(n === 0 ? "router: pool 已清空（全部可用模型参与路由）" : `router: pool 已更新（${n} 模型）`, "info");
+              } catch (e) { ctx.ui.notify(`router: pool 保存失败 ${String(e).slice(0, 120)}`, "error"); }
+              // 非空池 → 弹命名框存为预设
+              if (sel.length > 0) {
+                const name = await openNamePrompt("保存为预设？输入名称（esc 跳过仅设池）");
+                if (name) {
+                  persistPoolPreset(name, sel);
+                  if (watcher) watcher.reload();
+                  ctx.ui.notify(`router: 预设 "${name}" 已保存（${sel.length} 模型）`, "info");
+                }
+              }
+              presets = presetList();
+              activeModels = [...((watcher?.get() ?? loadConfig(ctx.cwd)).pool ?? [])];
+              mgr.update(presets, activeModels);
+              break;
+            }
+          }
         }
         return;
       }

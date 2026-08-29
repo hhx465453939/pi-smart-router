@@ -202,8 +202,8 @@ export type NamePromptAction =
   | { type: "confirm"; name: string }
   | { type: "cancel" };
 
-export function initNamePrompt(hint = ""): NamePromptState {
-  return { text: "", hint };
+export function initNamePrompt(hint = "", initialText = ""): NamePromptState {
+  return { text: initialText, hint };
 }
 
 export function applyNameInput(state: NamePromptState, data: string): NamePromptAction {
@@ -234,7 +234,7 @@ export class NamePromptComponent {
   private state: NamePromptState;
   onConfirm: (name: string) => void = () => {};
   onCancel: () => void = () => {};
-  constructor(hint = "") { this.state = initNamePrompt(hint); }
+  constructor(hint = "", initialText = "") { this.state = initNamePrompt(hint, initialText); }
   handleInput(data: string, requestRender: () => void): void {
     const act = applyNameInput(this.state, data);
     if (act.type === "cancel") { this.onCancel(); return; }
@@ -314,5 +314,135 @@ export class PresetPickerComponent {
   }
   render(width: number, theme?: PickerTheme): string[] {
     return renderPresetPicker(this.state, width, theme);
+  }
+}
+
+// ————————————————— 预设管理面板（/router pool 主入口）—————————————————
+// 状态机 + 渲染分离，重复 multipick 设计范式：reducer 可单测，组件壳接 ctx.ui.custom。
+// 操作键位（底部常驻标注）：
+//   ↑↓ 选中 · enter 激活预设 · e 编辑该预设模型 · r 重命名 · d 删除 · n 新建预设 · esc 退出
+
+export interface PresetManagerState {
+  cursor: number;
+  items: PresetItem[];
+  /** 当前激活池的模型集合（预设对比标记「当前」用） */
+  activeModels: string[];
+  /** 非空时表示当前处在 delete 确认子状态，值为待删预设名 */
+  pendingDelete: string | null;
+}
+
+export type PresetManagerAction =
+  | { type: "continue"; state: PresetManagerState }
+  | { type: "activate"; item: PresetItem }
+  | { type: "edit"; item: PresetItem }
+  | { type: "rename"; item: PresetItem }
+  | { type: "delete"; name: string }
+  | { type: "create" }
+  | { type: "cancel" };
+
+export function initPresetManager(items: PresetItem[], activeModels: string[]): PresetManagerState {
+  return { cursor: 0, items, activeModels, pendingDelete: null };
+}
+
+/** 判断某预设是否为当前激活池（忽略顺序，小写比较） */
+function isActivePreset(item: PresetItem, activeModels: string[]): boolean {
+  if (activeModels.length === 0) return false;
+  if (item.models.length !== activeModels.length) return false;
+  const a = new Set(activeModels.map((s) => s.toLowerCase()));
+  return item.models.every((m) => a.has(m.toLowerCase()));
+}
+
+function clampManagerCursor(s: PresetManagerState): PresetManagerState {
+  if (s.items.length === 0) return { ...s, cursor: 0 };
+  return { ...s, cursor: Math.min(Math.max(0, s.cursor), s.items.length - 1) };
+}
+
+export function applyPresetManagerInput(state: PresetManagerState, data: string): PresetManagerAction {
+  // 删除确认子状态：enter / d / y 再次确认，esc 或其它取消
+  if (state.pendingDelete !== null) {
+    if (matchesKey(data, KEY.enter) || matchesKey(data, KEY.enterAlt) || matchesKey(data, "d") || matchesKey(data, "D") || matchesKey(data, "y") || matchesKey(data, "Y")) {
+      return { type: "delete", name: state.pendingDelete };
+    }
+    // 任意其它键（含 esc）取消确认
+    return { type: "continue", state: { ...state, pendingDelete: null } };
+  }
+
+  if (matchesKey(data, KEY.esc) || matchesKey(data, KEY.ctrlC)) return { type: "cancel" };
+  if (matchesKey(data, KEY.enter) || matchesKey(data, KEY.enterAlt)) {
+    const it = state.items[state.cursor];
+    return it ? { type: "activate", item: it } : { type: "continue", state };
+  }
+  if (matchesKey(data, KEY.up)) {
+    return { type: "continue", state: clampManagerCursor({ ...state, cursor: state.cursor - 1 }) };
+  }
+  if (matchesKey(data, KEY.down)) {
+    return { type: "continue", state: clampManagerCursor({ ...state, cursor: state.cursor + 1 }) };
+  }
+  // 单键操作（大写/小写均识别）
+  if (data === "e" || data === "E") {
+    const it = state.items[state.cursor];
+    return it ? { type: "edit", item: it } : { type: "continue", state };
+  }
+  if (data === "r" || data === "R") {
+    const it = state.items[state.cursor];
+    return it ? { type: "rename", item: it } : { type: "continue", state };
+  }
+  if (data === "d" || data === "D") {
+    const it = state.items[state.cursor];
+    return it ? { type: "continue", state: { ...state, pendingDelete: it.name } } : { type: "continue", state };
+  }
+  if (data === "n" || data === "N") return { type: "create" };
+  return { type: "continue", state };
+}
+
+export function renderPresetManager(state: PresetManagerState, width: number, theme?: PickerTheme): string[] {
+  const fg: (color: string, text: string) => string = theme ? (c, t) => theme.fg(c, t) : (_c, t) => t;
+  const lines: string[] = [];
+  lines.push(fg("accent", "预设管理") + fg("dim", " ─ ↑↓选择 · 各键操作见下方"));
+  lines.push(fg("dim", "当前池: " + (state.activeModels.length ? state.activeModels.join(", ") : "(全部可用)")));
+  lines.push("");
+  if (state.items.length === 0) {
+    lines.push(fg("warning", "  (暂无预设 — 按 n 新建，或 /router pool 选中模型后回车保存)"));
+  } else {
+    for (let i = 0; i < state.items.length; i++) {
+      const it = state.items[i];
+      const cursorMark = i === state.cursor ? "> " : "  ";
+      const mark = isActivePreset(it, state.activeModels) ? fg("success", "● 当前") : "";
+      const name = i === state.cursor ? fg("accent", it.name) : it.name;
+      lines.push(`${cursorMark}${name}  (${it.models.length} 模型)  ${mark}`);
+    }
+  }
+  lines.push("");
+  if (state.pendingDelete !== null) {
+    lines.push(fg("warning", `确认删除 "${state.pendingDelete}"？enter/d 确认 · 其它键取消`));
+  } else {
+    lines.push(fg("dim", "enter 激活 · e 编辑模型 · r 重命名 · d 删除 · n 新建 · esc 退出"));
+  }
+  return lines.map((l) => (l.length > width ? l.slice(0, width) : l));
+}
+
+export class PresetManagerComponent {
+  private state: PresetManagerState;
+  onAction: (action: PresetManagerAction) => void = () => {};
+  onCancel: () => void = () => {};
+
+  constructor(items: PresetItem[], activeModels: string[]) {
+    this.state = initPresetManager(items, activeModels);
+  }
+
+  handleInput(data: string, requestRender: () => void): void {
+    const act = applyPresetManagerInput(this.state, data);
+    if (act.type === "cancel") { this.onCancel(); return; }
+    if (act.type === "continue") { this.state = act.state; requestRender(); return; }
+    this.onAction(act);
+  }
+
+  /** after action resolves, refresh items + activeModels (keep cursor) */
+  update(items: PresetItem[], activeModels: string[]): void {
+    this.state = clampManagerCursor({ ...this.state, items, activeModels, pendingDelete: null });
+  }
+
+  render(width: number, theme?: PickerTheme): string[] {
+    return renderPresetManager(this.state, width, theme);
   }
 }

@@ -75,19 +75,22 @@ cp examples/pi-router.cn.json ~/.pi/agent/pi-router.json
 ### 模型池 + 预设（圈定可信模型集合）
 
 ```bash
-/router pool               # 交互多选器：搜索 + 空格勾选 + 回车保存（随后弹命名框存为预设）
+/router pool               # 预设管理面板：↑↓ 选中 · enter 激活 · e 编辑模型 · r 重命名 · d 删除 · n 新建 · esc 退出
 /router pool use           # 预设单选器：↑↓ 选择 · 回车切换
 /router pool use <预设名>   # 直接切换到指定预设
 /router pool save <预设名>  # 当前池存为预设
 /router pool list          # 列出全部预设（含当前激活标记）
 /router pool rm <预设名>    # 删除预设
+/router pool rename <旧名> <新名>  # 重命名预设
 ```
+
+- 直接 `/router pool`（无子命令）进入**预设管理面板**：左侧 △ 键位一目了然，回车激活，`e` 编辑该预设模型（预勾选），`r` 重命名（预填旧名），`d` 删除（二次确认），`n` 新建。操作完成自动刷新回到面板，esc 退出。
 
 - 池非空时，**所有自动决策（规则/rank/self-learn/粘滞/默认/fallback/秒切）只在池内选**；池外规则模型被跳过。
 - `@model:xxx` 手动指定仍是最高优先级（用户意志高于池）。
 - 空池 = 不过滤（全部可用模型参与路由）。
 
-**预设工作流**：`/router pool` 勾选回车后弹命名框（esc 跳过不保存），把不同场景的池存成命名预设：
+**预设工作流**：`/router pool`（无子命令）进入预设管理面板，选中预设后回车即切换；或 `n` 新建（预勾选当前池 → 回车保存 → 弹命名框），把不同场景的池存成命名预设：
 
 - **日常**：主力 + 兜底（8 个）—— 平时默认
 - **攻坚**：k3 / codex / pro 级全上 —— 大重构、难调试时 `/router pool use 攻坚`
