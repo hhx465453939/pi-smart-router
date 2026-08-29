@@ -195,6 +195,52 @@ async function main() {
   const scenario = process.argv[2] ?? "quota-rule-loop";
   console.log(`=== Router Harness | scenario=${scenario} ===\n`);
 
+  if (scenario === "dup-injection-guard") {
+    // 回归场景：fallback 链 + 双钩子 + tool_result 四重触发，断言 sendUserMessage 全链只注入 1 次。
+    // 旧实现（key=prompt+failedSelector，阈值 3）在这个场景会注 3+ 条重复用户指令。
+    const harness = new Harness();
+    const factory = (await import("../src/index.ts")).default;
+    factory(harness.buildApi());
+
+    const fs = await import("node:fs");
+    const harnessDir = "/tmp/router-harness-home";
+    fs.mkdirSync(harnessDir + "/.pi/agent", { recursive: true });
+    fs.writeFileSync(harnessDir + "/.pi/agent/pi-router.json", JSON.stringify(FAKE_CONFIG, null, 2));
+    process.env.HOME = harnessDir;
+    process.env.USERPROFILE = harnessDir;
+
+    await harness.fire("session_start", { reason: "test" });
+    const prompt = "请分析这份长文档".repeat(200);
+    await harness.fire("before_agent_start", { prompt, images: [], systemPromptOptions: { selectedTools: ["bash", "edit"] } });
+
+    // 触发 1+2：连续 429 ×2 → n>=2 → tryImmediateFallback → setModel + sendUserMessage(注入 #1)
+    await harness.fire("after_provider_response", { status: 429, headers: {} });
+    await harness.fire("after_provider_response", { status: 429, headers: {} });
+    const afterChainSwitch = harness.getCurrentSelector();
+
+    // 触发 3：message_end 同一轮失败（同一 prompt）→ 应被纯 prompt 计数拦住
+    await harness.fire("message_end", {
+      message: { role: "assistant", stopReason: "error", errorMessage: 'Retry failed: 429 AccountQuotaExceeded', provider: "volces", model: "deepseek-v4-flash[1m]", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } },
+    });
+
+    // 触发 4：tool_result 额度耗尽 → 同样应被拦住
+    await harness.fire("tool_result", { isError: true, content: [{ type: "text", text: "Error: AccountQuotaExceeded — quota exceeded" }] });
+
+    const calls = harness.getSendMessageCalls();
+    const injections = calls.filter((c) => c.includes(prompt.slice(0, 40))).length;
+    console.log(`  fallback 链首次切换后模型: ${afterChainSwitch}`);
+    console.log(`  message_end + tool_result 二次触发后 sendUserMessage 总数: ${calls.length}`);
+    console.log(`\n=== 断言 ===`);
+    console.log(`  重复指令注入次数（期望 1）: ${injections} ${injections === 1 ? "✅ PASS" : "❌ FAIL"}`);
+    if (injections !== 1) {
+      for (const c of calls) console.log(`    call: ${c.slice(0, 80)}...`);
+      process.exit(1);
+    }
+    console.log(`\n=== 最近 10 条通知 ===`);
+    for (const n of harness.notifications.slice(-10)) console.log("  " + n);
+    return;
+  }
+
   if (scenario === "pool-boundary") {
     FAKE_CONFIG.pool = ["opencode/deepseek-v4-flash", "zai/glm-5.3", "shudie/deepseek-v4-flash-0731"];
     console.log("    pool-boundary: 已启用模型池 → " + FAKE_CONFIG.pool.join(", "));
@@ -275,6 +321,8 @@ async function main() {
 }
 
 main().catch((e) => { console.error("HARNESS ERR:", e); process.exit(1); });
+// probe 后台探测 timer 会挂住事件循环，必须显式退出
+setTimeout(() => process.exit(0), 500).unref?.();
 
 // 部署建议：在 CI / 本地开发时用此脚本验证扩展链路
 // 后续可拓展：multi-fallback exhaustion 场景、规则循环重置场景等
