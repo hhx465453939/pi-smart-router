@@ -55,7 +55,7 @@ describe("pool config", () => {
   });
 });
 
-import { persistPoolPreset, removePoolPreset, applyPoolPreset } from "../src/config.ts";
+import { persistPoolPreset, removePoolPreset, renamePoolPreset, applyPoolPreset } from "../src/config.ts";
 
 describe("pool presets", () => {
   it("save → list → activate → remove roundtrip", () => {
@@ -81,6 +81,28 @@ describe("pool presets", () => {
     const raw2 = JSON.parse(readFileSync(globalConfigPath(), "utf8")) as { poolPresets?: Record<string, string[]> };
     assert.ok(!raw2.poolPresets?.["日常"]);
     assert.ok(raw2.poolPresets?.["攻坚"]);
+  });
+
+  it("rename: renames existing preset, fails on missing", () => {
+    persistPoolPreset("旧名", ["x/1"]);
+    persistPoolPreset("其他", ["y/2"]);
+
+    // 重命名成功
+    assert.equal(renamePoolPreset("旧名", "新名"), true);
+    const raw = JSON.parse(readFileSync(globalConfigPath(), "utf8")) as { poolPresets?: Record<string, string[]> };
+    assert.ok(!raw.poolPresets?.["旧名"], "旧名已删除");
+    assert.deepEqual(raw.poolPresets?.["新名"], ["x/1"], "新名存在且模型正确");
+    assert.ok(raw.poolPresets?.["其他"], "其他预设不受影响");
+
+    // 旧名不存在
+    assert.equal(renamePoolPreset("不存在", "随便"), false);
+
+    // 同名不操作
+    assert.equal(renamePoolPreset("新名", "新名"), false);
+
+    // 空名不做
+    assert.equal(renamePoolPreset("新名", ""), false);
+    assert.equal(renamePoolPreset("", "随便"), false);
   });
 
   it("normalizeConfig parses poolPresets (drop empty/invalid)", () => {

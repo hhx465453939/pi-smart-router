@@ -8,7 +8,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { DecisionRecord, NormalizedRouterConfig } from "./types.ts";
-import { loadConfig, createConfigWatcher, persistEnabled, persistPool, persistPoolPreset, removePoolPreset, applyPoolPreset, filterByPool, type ConfigWatcher } from "./config.ts";
+import { loadConfig, createConfigWatcher, persistEnabled, persistPool, persistPoolPreset, removePoolPreset, renamePoolPreset, applyPoolPreset, filterByPool, type ConfigWatcher } from "./config.ts";
 import { CooldownSet } from "./engine/registry.ts";
 import { CacheManager } from "./engine/cache.ts";
 import { LearningManager } from "./engine/learn.ts";
@@ -676,7 +676,7 @@ export default function (pi: ExtensionAPI) {
 
   // ——— /router 命令 ———
   pi.registerCommand("router", {
-    description: "pi-smart-router: status / rules / reload / clear-cooldown / toggle / test / cache / learn / pool [use|save|list|rm]",
+    description: "pi-smart-router: status / rules / reload / clear-cooldown / toggle / test / cache / learn / pool [use|save|rename|list|rm]",
     handler: async (args, ctx) => {
       const raw = String(args ?? "").trim();
       const [sub, ...rest] = raw.split(/\s+/).filter(Boolean);
@@ -704,7 +704,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       if (cmd === "pool") {
-        // 子命令：save <名> / use [名] / list / rm <名>
+        // 子命令：save <名> / use [名] / list / rm <名> / rename <旧名> <新名>
         const subArg = rest.join(" ").trim();
         const presetList = (): Array<{ name: string; models: string[] }> => {
           const c = watcher?.get() ?? loadConfig(ctx.cwd);
@@ -739,6 +739,18 @@ export default function (pi: ExtensionAPI) {
           const ok = removePoolPreset(name);
           if (watcher) watcher.reload();
           ctx.ui.notify(ok ? `router: 预设 "${name}" 已删除` : `router: 预设 "${name}" 不存在`, ok ? "info" : "warning");
+          return;
+        }
+        if (subArg.startsWith("rename")) {
+          const rest2 = subArg.slice(6).trim();
+          const spaceIdx = rest2.indexOf(" ");
+          if (spaceIdx === -1) { ctx.ui.notify("用法: /router pool rename <旧名> <新名>", "warning"); return; }
+          const oldName = rest2.slice(0, spaceIdx).trim();
+          const newName = rest2.slice(spaceIdx + 1).trim();
+          if (!oldName || !newName) { ctx.ui.notify("用法: /router pool rename <旧名> <新名>", "warning"); return; }
+          const ok = renamePoolPreset(oldName, newName);
+          if (watcher) watcher.reload();
+          ctx.ui.notify(ok ? `router: 预设 "${oldName}" 已重命名为 "${newName}"` : `router: 预设 "${oldName}" 不存在`, ok ? "info" : "warning");
           return;
         }
         if (subArg.startsWith("use")) {

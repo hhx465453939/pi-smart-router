@@ -206,6 +206,26 @@ export function removePoolPreset(name: string): boolean {
   } catch { return false; }
 }
 
+/** 重命名预设池 */
+export function renamePoolPreset(oldName: string, newName: string): boolean {
+  const old = oldName.trim();
+  const n = newName.trim();
+  if (!old || !n || old === n) return false;
+  const raw = readGlobalRaw();
+  const presets = (raw.poolPresets && typeof raw.poolPresets === "object" ? raw.poolPresets : {}) as Record<string, string[]>;
+  if (!(old in presets)) return false;
+  const models = presets[old];
+  delete presets[old];
+  presets[n] = models;
+  raw.poolPresets = presets;
+  try {
+    const targetPath = globalConfigPath();
+    mkdirSync(dirname(targetPath), { recursive: true });
+    writeFileSync(targetPath, JSON.stringify(raw, null, 2) + "\n", "utf8");
+    return true;
+  } catch { return false; }
+}
+
 /** 激活预设：pool = poolPresets[name]（同时持久化） */
 export function applyPoolPreset(name: string): string[] | undefined {
   const n = name.trim();
