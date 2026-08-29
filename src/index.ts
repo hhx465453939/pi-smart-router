@@ -164,11 +164,16 @@ export default function (pi: ExtensionAPI) {
       // 若 rank 为空，回退到原 candidates 顺序
       if (ranked.length === 0) ranked = candidates;
     }
-    // 防循环：同 prompt 短时间内最多 3 次
-    const promptHash = `${lastPromptText.slice(0, 200)}::${failedSelector}`;
+    // 防循环 + 防重复注入：同一条 prompt 在时间窗内只允许自动重试一次。
+    // 注意 key 只用 prompt 本身（不含 failedSelector）——旧实现按「prompt+失败模型」组合计数，
+    // fallback 链 A→B→C 每换一个模型 key 就重置，每成功切换一次就 sendUserMessage 注入一条
+    // 重复的用户消息（持久化进 session、永不撤销），导致「每换一次模型，上一条指令就累加一份」。
+    // 同一失败还可能同时命中 after_provider_response 与 message_end 两个钩子，双倍注入。
+    // 纯 prompt 计数把整条 fallback 链的注入上限压到 1 条；再失败只切模型并提示手动重发。
+    const promptHash = lastPromptText.slice(0, 200);
     const tries = recentFallbackTries.get(promptHash) ?? 0;
-    if (tries >= 3) {
-      ctx.ui.notify(`router: 已尝试 3 次仍失败，暂停自动切换`, "warning");
+    if (tries >= 1) {
+      ctx.ui.notify(`router: 同一指令已自动重试过一次，不再重复注入（避免 session 堆积重复消息）。已切换/候选模型见上方提示，请手动重发指令`, "warning");
       return false;
     }
     recentFallbackTries.set(promptHash, tries + 1);
