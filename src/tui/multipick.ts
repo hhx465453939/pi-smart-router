@@ -402,7 +402,7 @@ export function renderPresetManager(state: PresetManagerState, width: number, th
   lines.push(fg("dim", "当前池: " + (state.activeModels.length ? state.activeModels.join(", ") : "(全部可用)")));
   lines.push("");
   if (state.items.length === 0) {
-    lines.push(fg("warning", "  (暂无预设 — 按 n 新建，或 /router pool 选中模型后回车保存)"));
+    lines.push(fg("warning", "  (暂无预设 — 按 n 新建：勾选模型并命名即可保存)"));
   } else {
     for (let i = 0; i < state.items.length; i++) {
       const it = state.items[i];

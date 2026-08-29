@@ -24,7 +24,7 @@
 
 **模型池（Model Pool）— 自动路由的硬边界** — 60+ 模型太杂？`/router pool` 交互多选器圈一个可信池：池非空时所有自动决策只在池内选，池外模型即使规则命中也被跳过；`@model:` 显式指定不受限；空池 = 不过滤。
 
-**命名预设池** — 把不同场景的池存成命名预设（日常/攻坚/省钱），`/router pool use <名>` 一键切换，存全局 `~/.pi/agent/pi-router.json`。
+**命名预设池** — 把不同场景的池存成命名预设（日常/攻坚/省钱），`/router pool` 面板中选中回车一键切换，存全局 `~/.pi/agent/pi-router.json`。
 
 **router_handoff 工具** — 当前模型可主动把工作交接给更适合的模型，上下文/缓存无缝保留，交接结果喂 self-learn。
 
@@ -75,16 +75,10 @@ cp examples/pi-router.cn.json ~/.pi/agent/pi-router.json
 ### 模型池 + 预设（圈定可信模型集合）
 
 ```bash
-/router pool               # 预设管理面板：↑↓ 选中 · enter 激活 · e 编辑模型 · r 重命名 · d 删除 · n 新建 · esc 退出
-/router pool use           # 预设单选器：↑↓ 选择 · 回车切换
-/router pool use <预设名>   # 直接切换到指定预设
-/router pool save <预设名>  # 当前池存为预设
-/router pool list          # 列出全部预设（含当前激活标记）
-/router pool rm <预设名>    # 删除预设
-/router pool rename <旧名> <新名>  # 重命名预设
+/router pool               # 直接打开预设管理面板，所有操作键位写在面板底部，无需记任何子命令
 ```
 
-- 直接 `/router pool`（无子命令）进入**预设管理面板**：左侧 △ 键位一目了然，回车激活，`e` 编辑该预设模型（预勾选），`r` 重命名（预填旧名），`d` 删除（二次确认），`n` 新建。操作完成自动刷新回到面板，esc 退出。
+- `/router pool` 直接进入**预设管理面板**：预设列表 + 当前池一目了然，底部键位常驻标注——↑↓ 选中、enter 激活、`e` 编辑该预设模型（预勾选）、`r` 重命名（预填旧名）、`d` 删除（二次确认）、`n` 新建。操作完成自动刷新回到面板，esc 退出。
 
 - 池非空时，**所有自动决策（规则/rank/self-learn/粘滞/默认/fallback/秒切）只在池内选**；池外规则模型被跳过。
 - `@model:xxx` 手动指定仍是最高优先级（用户意志高于池）。
@@ -93,7 +87,7 @@ cp examples/pi-router.cn.json ~/.pi/agent/pi-router.json
 **预设工作流**：`/router pool`（无子命令）进入预设管理面板，选中预设后回车即切换；或 `n` 新建（预勾选当前池 → 回车保存 → 弹命名框），把不同场景的池存成命名预设：
 
 - **日常**：主力 + 兜底（8 个）—— 平时默认
-- **攻坚**：k3 / codex / pro 级全上 —— 大重构、难调试时 `/router pool use 攻坚`
+- **攻坚**：k3 / codex / pro 级全上 —— 大重构、难调试时面板里选中回车切换
 - **省钱**：纯 flash 档 —— 跑量任务、夜里挂机时切换
 
 预设与池均存全局 `~/.pi/agent/pi-router.json`，切换热生效，`/router status` 一眼可见当前激活池。
@@ -123,7 +117,7 @@ cp examples/pi-router.cn.json ~/.pi/agent/pi-router.json
 /router value [难度]      — 全部模型自动画像性价比排名
 /router probe             — 本 session 可用性探测快照
 /router handoff           — 最近交接事件
-/router pool [use|save|list|rm] — 模型池多选器 + 命名预设管理（见上节）
+/router pool               — 预设管理面板（激活/编辑/重命名/删除/新建，键位见面板）
 /router reload            — 从 pi-router.json 热加载配置
 /router clear [model]     — 清除指定模型或全部冷却
 /router clear-cache       — 清除缓存记录

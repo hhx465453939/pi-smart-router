@@ -17,7 +17,7 @@ import { resolveTurnDecision } from "./hooks/agent.ts";
 import { resolveProviderDecision } from "./hooks/provider.ts";
 import { onProviderResponse, onToolResult, isQuotaExceeded } from "./hooks/failure.ts";
 import { formatRules, formatStatus } from "./commands/router.ts";
-import { PoolPickerComponent, NamePromptComponent, PresetPickerComponent, PresetManagerComponent, type PresetManagerAction, type PoolItem, type PresetItem, type PickerTheme } from "./tui/multipick.ts";
+import { PoolPickerComponent, NamePromptComponent, PresetManagerComponent, type PresetManagerAction, type PoolItem, type PresetItem, type PickerTheme } from "./tui/multipick.ts";
 import { buildRouterTool } from "./tool/router.ts";
 import { classifyTaskType } from "./context/task.ts";
 import { ModelCatalog } from "./catalog/catalog.ts";
@@ -676,7 +676,7 @@ export default function (pi: ExtensionAPI) {
 
   // ——— /router 命令 ———
   pi.registerCommand("router", {
-    description: "pi-smart-router: status / rules / reload / clear-cooldown / toggle / test / cache / learn / pool [回车=选中管理 | use|save|rename|list|rm]",
+    description: "pi-smart-router: status / rules / reload / clear-cooldown / toggle / test / cache / learn / pool (预设管理面板，键位见面板)",
     handler: async (args, ctx) => {
       const raw = String(args ?? "").trim();
       const [sub, ...rest] = raw.split(/\s+/).filter(Boolean);
@@ -704,85 +704,11 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       if (cmd === "pool") {
-        // 子命令：save <名> / use [名] / list / rm <名> / rename <旧名> <新名>
-        const subArg = rest.join(" ").trim();
+        // 直接进入预设管理面板 — 所有操作（激活/编辑/重命名/删除/新建）键位都写在面板上，无需记任何子命令
         const presetList = (): Array<{ name: string; models: string[] }> => {
           const c = watcher?.get() ?? loadConfig(ctx.cwd);
           return Object.entries(c.poolPresets ?? {}).map(([name, models]) => ({ name, models }));
         };
-        if (subArg.startsWith("save")) {
-          const name = subArg.slice(4).trim();
-          const c = watcher?.get() ?? loadConfig(ctx.cwd);
-          if (!name) { ctx.ui.notify("用法: /router pool save <预设名>", "warning"); return; }
-          if (!c.pool?.length) { ctx.ui.notify("router: 当前池为空，先用 /router pool 挑选再保存", "warning"); return; }
-          try {
-            persistPoolPreset(name, c.pool);
-            if (watcher) watcher.reload();
-            ctx.ui.notify(`router: 预设 "${name}" 已保存（${c.pool.length} 模型）`, "info");
-          } catch (e) { ctx.ui.notify(`router: 保存预设失败 ${String(e).slice(0, 100)}`, "error"); }
-          return;
-        }
-        if (subArg === "list" || subArg === "ls") {
-          const ps = presetList();
-          if (!ps.length) { ctx.ui.notify("router: 无预设 — /router pool 挑选后回车即可命名保存", "info"); return; }
-          const c = watcher?.get() ?? loadConfig(ctx.cwd);
-          const lines = ps.map((p) => {
-            const active = c.pool?.length && p.models.length === c.pool.length && p.models.every((m, i) => m === c.pool![i]) ? " ← 当前" : "";
-            return `  ${p.name} (${p.models.length} 模型)${active}\n    ${p.models.join(", ")}`;
-          });
-          ctx.ui.notify(`pool 预设 (${ps.length}):\n${lines.join("\n")}\n切换: /router pool use [预设名]`, "info");
-          return;
-        }
-        if (subArg.startsWith("rm") && !subArg.startsWith("rules")) {
-          const name = subArg.slice(2).trim();
-          if (!name) { ctx.ui.notify("用法: /router pool rm <预设名>", "warning"); return; }
-          const ok = removePoolPreset(name);
-          if (watcher) watcher.reload();
-          ctx.ui.notify(ok ? `router: 预设 "${name}" 已删除` : `router: 预设 "${name}" 不存在`, ok ? "info" : "warning");
-          return;
-        }
-        if (subArg.startsWith("rename")) {
-          const rest2 = subArg.slice(6).trim();
-          const spaceIdx = rest2.indexOf(" ");
-          if (spaceIdx === -1) { ctx.ui.notify("用法: /router pool rename <旧名> <新名>", "warning"); return; }
-          const oldName = rest2.slice(0, spaceIdx).trim();
-          const newName = rest2.slice(spaceIdx + 1).trim();
-          if (!oldName || !newName) { ctx.ui.notify("用法: /router pool rename <旧名> <新名>", "warning"); return; }
-          const ok = renamePoolPreset(oldName, newName);
-          if (watcher) watcher.reload();
-          ctx.ui.notify(ok ? `router: 预设 "${oldName}" 已重命名为 "${newName}"` : `router: 预设 "${oldName}" 不存在`, ok ? "info" : "warning");
-          return;
-        }
-        if (subArg.startsWith("use")) {
-          const name = subArg.slice(3).trim();
-          // 直接激活指定预设
-          if (name) {
-            const models = applyPoolPreset(name);
-            if (watcher) watcher.reload();
-            if (!models) { ctx.ui.notify(`router: 预设 "${name}" 不存在或为空 — /router pool list 查看`, "warning"); return; }
-            ctx.ui.notify(`⚡ router: 已切换到预设 "${name}"（${models.length} 模型）`, "info");
-            return;
-          }
-          // 无名称：打开预设单选器
-          const ps = presetList();
-          if (!ps.length) { ctx.ui.notify("router: 无预设 — /router pool 挑选后回车即可命名保存", "info"); return; }
-          const picked = await (ctx.ui as unknown as { custom: <T>(fn: (tui: { requestRender: () => void }, theme: PickerTheme, kb: unknown, done: (v: T | null) => void) => { render: (w: number) => string[]; invalidate: () => void; handleInput: (d: string) => void }) => Promise<T | null> }).custom<{ name: string; models: string[] } | null>((tui, theme, _kb, done) => {
-            const pp = new PresetPickerComponent(ps);
-            pp.onConfirm = (item) => done(item);
-            pp.onCancel = () => done(null);
-            return {
-              render: (w) => pp.render(w, theme),
-              invalidate: () => {},
-              handleInput: (d) => pp.handleInput(d, () => tui.requestRender()),
-            };
-          });
-          if (!picked) { ctx.ui.notify("router: 未切换（取消）", "info"); return; }
-          persistPool(picked.models);
-          if (watcher) watcher.reload();
-          ctx.ui.notify(`⚡ router: 已切换到预设 "${picked.name}"（${picked.models.length} 模型）`, "info");
-          return;
-        }
-        // 主流程（无子命令）：预设管理面板 — 展示预设 + 当前池，↑↓选中，键位操作
         const uiCustom = ctx.ui as unknown as { custom: <T>(fn: (tui: { requestRender: () => void }, theme: PickerTheme, kb: unknown, done: (v: T | null) => void) => { render: (w: number) => string[]; invalidate: () => void; handleInput: (d: string) => void }) => Promise<T | null> };
         const nowCfg = watcher?.get() ?? loadConfig(ctx.cwd);
         let presets = presetList();
