@@ -195,6 +195,40 @@ async function main() {
   const scenario = process.argv[2] ?? "quota-rule-loop";
   console.log(`=== Router Harness | scenario=${scenario} ===\n`);
 
+  if (scenario === "no-channel-503") {
+    // 回归场景：503 model_not_found（new_api_error "No available channel"）应触发秒切 + 长排除。
+    // 旧实现 message_end 正则不匹配 503/model_not_found → 无冷却、无切档、指令丢失。
+    const harness = new Harness();
+    const factory = (await import("../src/index.ts")).default;
+    factory(harness.buildApi());
+    const fs = await import("node:fs");
+    const harnessDir = "/tmp/router-harness-home";
+    fs.mkdirSync(harnessDir + "/.pi/agent", { recursive: true });
+    fs.writeFileSync(harnessDir + "/.pi/agent/pi-router.json", JSON.stringify(FAKE_CONFIG, null, 2));
+    process.env.HOME = harnessDir;
+    process.env.USERPROFILE = harnessDir;
+
+    await harness.fire("session_start", { reason: "test" });
+    const prompt = "分析一下这段配置".repeat(100);
+    await harness.fire("before_agent_start", { prompt, images: [], systemPromptOptions: { selectedTools: ["bash", "edit"] } });
+    const errText = 'Retry failed after 3 attempts: 503 {"error":{"code":"model_not_found","message":"No available channel for model deepseek-v4-flash[1m] under group default (distributor) (request id: 202608290915209043788268d9d6YahpFfhl)","type":"new_api_error"}}';
+    await harness.fire("message_end", {
+      message: { role: "assistant", stopReason: "error", errorMessage: errText, provider: "volces", model: "deepseek-v4-flash[1m]", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } },
+    });
+
+    const finalSel = harness.getCurrentSelector();
+    const injections = harness.getSendMessageCalls().filter((c) => c.includes(prompt.slice(0, 20))).length;
+    console.log(`  最终模型: ${finalSel}`);
+    console.log(`\n=== 断言 ===`);
+    const ok = finalSel !== "volces/deepseek-v4-flash[1m]" && injections === 1;
+    console.log(`  已秒切（期望非 volces）: ${finalSel !== "volces/deepseek-v4-flash[1m]" ? "✅" : "❌"}`);
+    console.log(`  重试注入次数（期望 1）: ${injections} ${injections === 1 ? "✅" : "❌"}`);
+    if (!ok) process.exit(1);
+    console.log(`\n=== 最近 6 条通知 ===`);
+    for (const n of harness.notifications.slice(-6)) console.log("  " + n);
+    return;
+  }
+
   if (scenario === "dup-injection-guard") {
     // 回归场景：fallback 链 + 双钩子 + tool_result 四重触发，断言 sendUserMessage 全链只注入 1 次。
     // 旧实现（key=prompt+failedSelector，阈值 3）在这个场景会注 3+ 条重复用户指令。

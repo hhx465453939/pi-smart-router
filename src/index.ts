@@ -575,11 +575,18 @@ export default function (pi: ExtensionAPI) {
         const isAuth = /\b(401|402|403)\b|unauthorized|forbidden|payment/i.test(errText);
         const isQuota = /AccountQuotaExceeded|quota.*exceeded|exceeded.*quota/i.test(errText);
         const is429 = /\b429\b|TooManyRequests|rate.?limit/i.test(errText);
-        if (errSel && cfg0.enabled && (isAuth || isQuota || is429)) {
-          if (probe) probe.markAuthFailure(errSel);
-          cooldowns.add(errSel, isQuota || isAuth ? 60 * 60 * 1000 : 10 * 60 * 1000, `api_error: ${errText.slice(0, 80)}`);
-          ctx.ui.notify(`⚡ router: ${errSel} API 失败（${isQuota ? "额度耗尽" : isAuth ? "套餐失效" : "429 限流"}）— 本 session 排除，秒切其他供应商`, "error");
-          void tryImmediateFallback(errSel, ctx, isQuota ? "quota exceeded" : isAuth ? "auth failed" : "429");
+        // 模型在该供应商彻底无通道（503 new_api_error model_not_found）——重试永远无效，需长排除
+        const isNoChannel = /model_not_found|no available channel|model.*not.*(exist|found)|channel.*(not|unavailable)/i.test(errText);
+        // 泛 5xx 服务端故障——可能瞬时恢复，短冷却 + 秒切重试一次
+        const is5xx = /\b(500|502|503|504)\b|internal.?server|bad.?gateway|service.?unavailable/i.test(errText);
+        if (errSel && cfg0.enabled && (isAuth || isQuota || is429 || isNoChannel || is5xx)) {
+          const permanent = isAuth || isQuota || isNoChannel; // 无通道/套餐/额度 → 本 session 排除；429/5xx 瞬时 → 仅冷却
+          if (permanent && probe) probe.markAuthFailure(errSel);
+          cooldowns.add(errSel, permanent ? 60 * 60 * 1000 : 10 * 60 * 1000, `api_error: ${errText.slice(0, 80)}`);
+          const kind = isNoChannel ? "模型无通道（503 model_not_found）"
+            : isQuota ? "额度耗尽" : isAuth ? "套餐失效" : is429 ? "429 限流" : "5xx 服务故障";
+          ctx.ui.notify(`⚡ router: ${errSel} API 失败（${kind}）— 本 session 排除，秒切其他供应商`, "error");
+          void tryImmediateFallback(errSel, ctx, isNoChannel ? "model_not_found" : isQuota ? "quota exceeded" : isAuth ? "auth failed" : is429 ? "429" : "5xx server error");
           return; // 失败轮不记录缓存/学习
         }
       }
