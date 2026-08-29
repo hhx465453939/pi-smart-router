@@ -169,3 +169,69 @@ describe("theme binding (pi crash regression)", () => {
     assert.ok(lines.length >= 4);
   });
 });
+
+import { initNamePrompt, applyNameInput, renderNamePrompt, initPresetPicker, applyPresetInput, renderPresetPicker } from "../src/tui/multipick.ts";
+
+describe("name prompt (preset naming)", () => {
+  it("typing builds name, backspace edits, enter confirms trimmed", () => {
+    let s = initNamePrompt("保存为预设？输入名称");
+    for (const ch of "日 常 ") s = (applyNameInput(s, ch) as { state: typeof s }).state;
+    // 尾随空格被 trim：先删掉再确认
+    s = (applyNameInput(s, "\x7f") as { state: typeof s }).state;
+    const act = applyNameInput(s, "\r");
+    assert.equal(act.type, "confirm");
+    if (act.type === "confirm") assert.equal(act.name, "日 常");
+  });
+  it("enter with empty name cancels (skip)", () => {
+    assert.equal(applyNameInput(initNamePrompt(), "\r").type, "cancel");
+  });
+  it("esc cancels, chinese input works", () => {
+    assert.equal(applyNameInput(initNamePrompt(), "\x1b").type, "cancel");
+    let s = initNamePrompt();
+    s = (applyNameInput(s, "攻") as { state: typeof s }).state;
+    s = (applyNameInput(s, "坚") as { state: typeof s }).state;
+    assert.equal(s.text, "攻坚");
+  });
+  it("render shows hint, name and help", () => {
+    let s = initNamePrompt("保存为预设？输入名称");
+    s = (applyNameInput(s, "d") as { state: typeof s }).state;
+    const lines = renderNamePrompt(s, 80);
+    assert.ok(lines.some((l) => l.includes("保存为预设")));
+    assert.ok(lines.some((l) => l.includes("名称: d█")));
+    assert.ok(lines.some((l) => l.includes("esc 跳过")));
+  });
+});
+
+describe("preset picker", () => {
+  const items = [
+    { name: "日常", models: ["zai/glm-5.3", "volces/dsv4"] },
+    { name: "攻坚", models: ["kimi/k3"] },
+    { name: "省钱", models: ["shudie/flash", "zai/flash"] },
+  ];
+  it("arrows move with clamp, enter confirms item", () => {
+    let s = initPresetPicker(items);
+    assert.equal(s.cursor, 0);
+    s = (applyPresetInput(s, "\x1b[A") as { state: typeof s }).state;
+    assert.equal(s.cursor, 0);
+    s = (applyPresetInput(s, "\x1b[B") as { state: typeof s }).state;
+    s = (applyPresetInput(s, "\x1b[B") as { state: typeof s }).state;
+    assert.equal(s.cursor, 2);
+    s = (applyPresetInput(s, "\x1b[B") as { state: typeof s }).state;
+    assert.equal(s.cursor, 2);
+    const act = applyPresetInput(s, "\r");
+    assert.equal(act.type, "confirm");
+    if (act.type === "confirm") assert.equal(act.item.name, "省钱");
+  });
+  it("esc cancels; empty list enter cancels", () => {
+    assert.equal(applyPresetInput(initPresetPicker(items), "\x1b").type, "cancel");
+    assert.equal(applyPresetInput(initPresetPicker([]), "\r").type, "cancel");
+  });
+  it("render lists presets with counts and help", () => {
+    const lines = renderPresetPicker(initPresetPicker(items), 100);
+    assert.ok(lines.some((l) => l.includes("日常") && l.includes("2 模型")));
+    assert.ok(lines.some((l) => l.includes("> 日常")));
+    assert.ok(lines.some((l) => l.includes("共 3 个预设")));
+    const empty = renderPresetPicker(initPresetPicker([]), 100);
+    assert.ok(empty.some((l) => l.includes("无预设")));
+  });
+});

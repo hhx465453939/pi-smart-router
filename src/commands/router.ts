@@ -38,6 +38,9 @@ export function formatStatus(deps: RouterCommandDeps): string {
   lines.push(`rules: ${cfg.rules.length}  fallback: ${cfg.fallback?.mode ?? "off"}${cfg.fallback?.models?.length ? ` → ${cfg.fallback.models.join(", ")}` : ""}`);
   const pool = (cfg as unknown as { pool?: string[] }).pool;
   lines.push(`pool: ${!pool?.length ? "(全部可用模型)" : `${pool.length} 个 → ${pool.join(", ")}`}`);
+  const presets = (cfg as unknown as { poolPresets?: Record<string, string[]> }).poolPresets;
+  const presetNames = presets ? Object.keys(presets) : [];
+  if (presetNames.length) lines.push(`pool 预设 (${presetNames.length}): ${presetNames.map((n) => `${n}(${presets![n].length})`).join(", ")} — /router pool use 切换`);
   const cds = deps.cooldowns.all();
   if (cds.length) {
     lines.push(`cooldowns (${cds.length}):`);

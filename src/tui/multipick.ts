@@ -121,12 +121,16 @@ function fmtCost(n?: number): string {
 
 const MAX_VISIBLE = 12;
 
-/** 渲染：搜索行 + 勾选列表（滚动窗口）+ 帮助行 */
-export function renderPicker(state: PickerState, width: number, theme?: PickerTheme): string[] {
+/** 渲染：搜索行 + 勾选列表（滚动窗口）+ 帮助行；顶部可显示已有预设提示 */
+export function renderPicker(state: PickerState, width: number, theme?: PickerTheme, presets?: PresetItem[]): string[] {
   // 闭包包装保持 this 绑定（见文件头注释）；无 theme 时纯文本
   const fg: (color: string, text: string) => string = theme ? (c, t) => theme.fg(c, t) : (_c, t) => t;
   const lines: string[] = [];
   lines.push(fg("accent", "模型池") + fg("dim", " ─ 输入搜索 · ↑↓移动 · 空格勾选 · 回车保存 · esc取消"));
+  if (presets && presets.length > 0) {
+    const presetStr = presets.map((p) => `${p.name}(${p.models.length})`).join(" ");
+    lines.push(fg("dim", `预设: ${presetStr} — /router pool use 切换`));
+  }
   lines.push(fg("muted", `搜索: ${state.query || ""}█`));
   const list = filteredItems(state);
   if (list.length === 0) {
@@ -180,7 +184,135 @@ export class PoolPickerComponent {
     requestRender();
   }
 
+  render(width: number, theme?: PickerTheme, presets?: PresetItem[]): string[] {
+    return renderPicker(this.state, width, theme, presets);
+  }
+}
+
+// ————————————————— 预设池：命名输入框 + 预设单选器 —————————————————
+
+export interface NamePromptState {
+  text: string;
+  /** 提示语（如 "保存当前池为预设"） */
+  hint: string;
+}
+
+export type NamePromptAction =
+  | { type: "continue"; state: NamePromptState }
+  | { type: "confirm"; name: string }
+  | { type: "cancel" };
+
+export function initNamePrompt(hint = ""): NamePromptState {
+  return { text: "", hint };
+}
+
+export function applyNameInput(state: NamePromptState, data: string): NamePromptAction {
+  if (matchesKey(data, KEY.esc) || matchesKey(data, KEY.ctrlC)) return { type: "cancel" };
+  if (matchesKey(data, KEY.enter) || matchesKey(data, KEY.enterAlt)) {
+    return state.text.trim() ? { type: "confirm", name: state.text.trim() } : { type: "cancel" };
+  }
+  if (matchesKey(data, KEY.backspace) || matchesKey(data, KEY.backspaceAlt)) {
+    return { type: "continue", state: { ...state, text: state.text.slice(0, -1) } };
+  }
+  if (data.length >= 1 && !data.startsWith("\x1b") && !/[\r\n\t\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(data)) {
+    return { type: "continue", state: { ...state, text: state.text + data } };
+  }
+  return { type: "continue", state };
+}
+
+export function renderNamePrompt(state: NamePromptState, width: number, theme?: PickerTheme): string[] {
+  const fg: (color: string, text: string) => string = theme ? (c, t) => theme.fg(c, t) : (_c, t) => t;
+  const lines = [
+    fg("accent", state.hint || "命名"),
+    fg("muted", `名称: ${state.text}█`),
+    fg("dim", "回车确认 · esc 跳过"),
+  ];
+  return lines.map((l) => (l.length > width ? l.slice(0, width) : l));
+}
+
+export class NamePromptComponent {
+  private state: NamePromptState;
+  onConfirm: (name: string) => void = () => {};
+  onCancel: () => void = () => {};
+  constructor(hint = "") { this.state = initNamePrompt(hint); }
+  handleInput(data: string, requestRender: () => void): void {
+    const act = applyNameInput(this.state, data);
+    if (act.type === "cancel") { this.onCancel(); return; }
+    if (act.type === "confirm") { this.onConfirm(act.name); return; }
+    this.state = act.state;
+    requestRender();
+  }
   render(width: number, theme?: PickerTheme): string[] {
-    return renderPicker(this.state, width, theme);
+    return renderNamePrompt(this.state, width, theme);
+  }
+}
+
+export interface PresetItem {
+  name: string;
+  models: string[];
+}
+
+export interface PresetPickerState {
+  cursor: number;
+  items: PresetItem[];
+}
+
+export type PresetPickerAction =
+  | { type: "continue"; state: PresetPickerState }
+  | { type: "confirm"; item: PresetItem }
+  | { type: "cancel" };
+
+export function initPresetPicker(items: PresetItem[]): PresetPickerState {
+  return { cursor: 0, items };
+}
+
+function clampPresetCursor(s: PresetPickerState): PresetPickerState {
+  if (s.items.length === 0) return { ...s, cursor: 0 };
+  return { ...s, cursor: Math.min(Math.max(0, s.cursor), s.items.length - 1) };
+}
+
+export function applyPresetInput(state: PresetPickerState, data: string): PresetPickerAction {
+  if (matchesKey(data, KEY.esc) || matchesKey(data, KEY.ctrlC)) return { type: "cancel" };
+  if (matchesKey(data, KEY.enter) || matchesKey(data, KEY.enterAlt)) {
+    const it = state.items[state.cursor];
+    return it ? { type: "confirm", item: it } : { type: "cancel" };
+  }
+  if (matchesKey(data, KEY.up)) return { type: "continue", state: clampPresetCursor({ ...state, cursor: state.cursor - 1 }) };
+  if (matchesKey(data, KEY.down)) return { type: "continue", state: clampPresetCursor({ ...state, cursor: state.cursor + 1 }) };
+  return { type: "continue", state };
+}
+
+export function renderPresetPicker(state: PresetPickerState, width: number, theme?: PickerTheme): string[] {
+  const fg: (color: string, text: string) => string = theme ? (c, t) => theme.fg(c, t) : (_c, t) => t;
+  const lines: string[] = [];
+  lines.push(fg("accent", "预设模型池") + fg("dim", " ─ ↑↓选择 · 回车激活 · esc取消"));
+  if (state.items.length === 0) {
+    lines.push(fg("warning", "  (无预设 — /router pool 挑选后回车即可命名保存)"));
+  } else {
+    for (let i = 0; i < state.items.length; i++) {
+      const it = state.items[i];
+      const cursorMark = i === state.cursor ? "> " : "  ";
+      const body = `${cursorMark}${it.name}  (${it.models.length} 模型)`;
+      lines.push(i === state.cursor ? fg("accent", body) : body);
+    }
+  }
+  lines.push(fg("dim", `共 ${state.items.length} 个预设`));
+  return lines.map((l) => (l.length > width ? l.slice(0, width) : l));
+}
+
+export class PresetPickerComponent {
+  private state: PresetPickerState;
+  onConfirm: (item: PresetItem) => void = () => {};
+  onCancel: () => void = () => {};
+  constructor(items: PresetItem[]) { this.state = initPresetPicker(items); }
+  handleInput(data: string, requestRender: () => void): void {
+    const act = applyPresetInput(this.state, data);
+    if (act.type === "cancel") { this.onCancel(); return; }
+    if (act.type === "confirm") { this.onConfirm(act.item); return; }
+    this.state = act.state;
+    requestRender();
+  }
+  render(width: number, theme?: PickerTheme): string[] {
+    return renderPresetPicker(this.state, width, theme);
   }
 }

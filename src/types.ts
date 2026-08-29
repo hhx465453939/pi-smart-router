@@ -310,12 +310,16 @@ export interface RouterConfig {
   verbose?: boolean;
   /** 模型池：用户挑选的可用模型白名单，rank/规则/fallback/秒切只在此集合内进行；空=不过滤 */
   pool?: string[];
+  /** 预设池集合：名称 → 模型列表，可一键切换激活 */
+  poolPresets?: Record<string, string[]>;
 }
 
 /** 归一化后的配置（默认值已填充） */
 export interface NormalizedRouterConfig {
   /** 模型池（归一化：去空/去重；空数组=不过滤，全部可用模型参与路由） */
   pool: string[];
+  /** 预设池：名称 → 模型列表 */
+  poolPresets: Record<string, string[]>;
   cache: NormalizedCacheConfig;
   learn: NormalizedLearnConfig;
   churn: NormalizedChurnConfig;

@@ -69,11 +69,26 @@ pi 通过 `sessionId` 前缀缓存（Anthropic `cache_control` / OpenAI `prompt_
 - 兼容 auto-profiling：rank 只在池内执行，候选数大幅收敛，决策更快更可解释
 
 ```bash
-/router pool          # 打开多选器：搜索 + 空格勾选 + 回车保存
-/router status        # 状态行显示当前 pool
+/router pool          # 打开多选器：搜索 + 空格勾选 + 回车保存（随后可命名存为预设）
+/router pool use      # 预设单选器：↑↓ 选择 · 回车切换
+/router pool use <预设名>   # 直接切换到指定预设
+/router pool save <预设名>  # 当前池存为预设
+/router pool list     # 列出全部预设（含当前标记）
+/router pool rm <预设名>    # 删除预设
+/router status        # 状态行显示当前 pool + 预设清单
 ```
 
 > 💡 适合的信赖池：每个任务类型保留 1-2 个“主力”，加 1 个兜底快模型，总数 5-10 个即可覆盖全部规则。
+
+#### 预设工作流：场景化一键切换
+
+`/router pool` 勾选回车后弹命名框（esc 跳过不保存），把不同场景的池存成命名预设：
+
+- **日常**：主力 + 兜底（8 个）—— 平时默认
+- **攻坚**：k3 / codex / pro 级全上 —— 大重构、难调试时 `/router pool use 攻坚`
+- **省钱**：纯 flash 档 —— 跑量任务、夜里挂机时切换
+
+预设存全局 `~/.pi/agent/pi-router.json` 的 `poolPresets`，切换即写 `pool` 并热生效，当前激活池在 `/router status` 一眼可见。
 
 ## 为什么
 

@@ -76,9 +76,20 @@ export function normalizeConfig(raw: RouterConfig | undefined): NormalizedRouter
   const probeOnStart = r.probe?.probeOnStart !== false;
   const probeExclude = r.probe?.excludeUnavailable !== false;
   const pool = Array.isArray(r.pool) ? [...new Set(r.pool.filter((s): s is string => typeof s === "string" && s.trim() !== "").map((s) => s.trim()))] : [];
+  const poolPresets: Record<string, string[]> = {};
+  if (r.poolPresets && typeof r.poolPresets === "object") {
+    for (const [name, models] of Object.entries(r.poolPresets)) {
+      if (!name.trim()) continue;
+      if (Array.isArray(models)) {
+        const cleaned = [...new Set(models.filter((s): s is string => typeof s === "string" && s.trim() !== "").map((s) => s.trim()))];
+        if (cleaned.length > 0) poolPresets[name.trim()] = cleaned;
+      }
+    }
+  }
   return {
     enabled: r.enabled !== false,
     pool,
+    poolPresets,
     defaultModel: typeof r.defaultModel === "string" ? r.defaultModel.trim() || undefined : undefined,
     routingLevel,
     cooldownMs,
@@ -153,6 +164,57 @@ export function persistPool(pool: string[]): void {
     mkdirSync(dirname(targetPath), { recursive: true });
     writeFileSync(targetPath, JSON.stringify(raw, null, 2) + "\n", "utf8");
   } catch { /* 忽略写入失败 */ }
+}
+
+/** 读取全局配置原始 JSON（预设操作用） */
+export function readGlobalRaw(): Record<string, unknown> {
+  const targetPath = globalConfigPath();
+  if (existsSync(targetPath)) {
+    try { return JSON.parse(readFileSync(targetPath, "utf8")) as Record<string, unknown>; } catch { return {}; }
+  }
+  return {};
+}
+
+/** 保存预设池：poolPresets[name] = models（写入全局配置） */
+export function persistPoolPreset(name: string, models: string[]): void {
+  const n = name.trim();
+  if (!n || models.length === 0) return;
+  const raw = readGlobalRaw();
+  const presets = (raw.poolPresets && typeof raw.poolPresets === "object" ? raw.poolPresets : {}) as Record<string, string[]>;
+  presets[n] = models;
+  raw.poolPresets = presets;
+  try {
+    const targetPath = globalConfigPath();
+    mkdirSync(dirname(targetPath), { recursive: true });
+    writeFileSync(targetPath, JSON.stringify(raw, null, 2) + "\n", "utf8");
+  } catch { /* 忽略写入失败 */ }
+}
+
+/** 删除预设池 */
+export function removePoolPreset(name: string): boolean {
+  const n = name.trim();
+  const raw = readGlobalRaw();
+  const presets = (raw.poolPresets && typeof raw.poolPresets === "object" ? raw.poolPresets : {}) as Record<string, string[]>;
+  if (!(n in presets)) return false;
+  delete presets[n];
+  raw.poolPresets = presets;
+  try {
+    const targetPath = globalConfigPath();
+    mkdirSync(dirname(targetPath), { recursive: true });
+    writeFileSync(targetPath, JSON.stringify(raw, null, 2) + "\n", "utf8");
+    return true;
+  } catch { return false; }
+}
+
+/** 激活预设：pool = poolPresets[name]（同时持久化） */
+export function applyPoolPreset(name: string): string[] | undefined {
+  const n = name.trim();
+  const raw = readGlobalRaw();
+  const presets = (raw.poolPresets && typeof raw.poolPresets === "object" ? raw.poolPresets : {}) as Record<string, string[]>;
+  const models = presets[n];
+  if (!Array.isArray(models) || models.length === 0) return undefined;
+  persistPool(models);
+  return models;
 }
 
 /** 池过滤：pool 空 → 返回全部选择器（原样）；否则只保留池内（大小写不敏感） */

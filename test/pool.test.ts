@@ -54,3 +54,37 @@ describe("pool config", () => {
     assert.deepEqual(raw.pool, ["z/w"]);
   });
 });
+
+import { persistPoolPreset, removePoolPreset, applyPoolPreset } from "../src/config.ts";
+
+describe("pool presets", () => {
+  it("save → list → activate → remove roundtrip", () => {
+    persistPool(["volces/a", "zai/b"]);
+    persistPoolPreset("日常", ["volces/a", "zai/b"]);
+    persistPoolPreset("攻坚", ["kimi/k3", "opencode/pro"]);
+
+    // applyPoolPreset 激活 "日常" → 全局 pool 变为该预设
+    const applied = applyPoolPreset("日常");
+    assert.deepEqual(applied, ["volces/a", "zai/b"]);
+    const raw = JSON.parse(readFileSync(globalConfigPath(), "utf8")) as { pool?: string[]; poolPresets?: Record<string, string[]> };
+    assert.deepEqual(raw.pool, ["volces/a", "zai/b"]);
+
+    // 预设仍在，未激活的不受影响
+    assert.ok(raw.poolPresets && raw.poolPresets["攻坚"]);
+
+    // 未知预设 → undefined，不动配置
+    assert.equal(applyPoolPreset("不存在"), undefined);
+
+    // 删除
+    assert.equal(removePoolPreset("日常"), true);
+    assert.equal(removePoolPreset("不存在"), false);
+    const raw2 = JSON.parse(readFileSync(globalConfigPath(), "utf8")) as { poolPresets?: Record<string, string[]> };
+    assert.ok(!raw2.poolPresets?.["日常"]);
+    assert.ok(raw2.poolPresets?.["攻坚"]);
+  });
+
+  it("normalizeConfig parses poolPresets (drop empty/invalid)", () => {
+    const cfg = normalizeConfig({ poolPresets: { a: ["x/1", "x/1", "  "], bad: "not-array" as never, "": ["y/2"] } });
+    assert.deepEqual(cfg.poolPresets, { a: ["x/1"] });
+  });
+});

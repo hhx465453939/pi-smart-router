@@ -45,6 +45,7 @@ function cfg(overrides: Partial<NormalizedRouterConfig> = {}): NormalizedRouterC
     selfLearn: { enabled: false, minSamples: 3, decay: 0.9, successWeight: 1.0, failureWeight: -2.0, costWeight: -0.0001 },
     probe: { enabled: false, timeoutMs: 300000, probeOnStart: false, excludeUnavailable: true },
     pool: [],
+    poolPresets: {},
     ...overrides,
   };
 }
