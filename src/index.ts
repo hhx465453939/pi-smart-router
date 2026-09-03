@@ -126,6 +126,8 @@ export default function (pi: ExtensionAPI) {
 
   // 无痛切换：按当前场景/难度 rank 逐个试下一个可用模型，直至成功
   const recentFallbackTries = new Map<string, number>();
+  // 同一条 prompt 的 fallback 链上已失败过的模型 —— 候选永远绕开，避免 A→B 后 B 又失败切回 A
+  const recentFallbackFails = new Map<string, Set<string>>();
   const rateLimit429Count = new Map<string, number>();
   /** 归一化 model id 到家族基准：去 provider 前缀、小写、去 [1m]/-0731 等变体后缀，使跨供应商同款可匹配 */
   function normalizeModelBase(id: string): string {
@@ -138,11 +140,17 @@ export default function (pi: ExtensionAPI) {
   }
   async function tryImmediateFallback(failedSelector: string, ctx: ExtensionContext, reason: string): Promise<boolean> {
     const cfg = watcher?.get() ?? loadConfig(ctx.cwd);
+    const promptHash = lastPromptText.slice(0, 200);
+    // 本条 prompt 的 fallback 链上已失败过的模型：候选永远绕开（换链不走回头路）
+    const failedSet = recentFallbackFails.get(promptHash) ?? new Set<string>();
+    failedSet.add(failedSelector.toLowerCase());
+    recentFallbackFails.set(promptHash, failedSet);
+    setTimeout(() => recentFallbackFails.delete(promptHash), 10 * 60_000);
     // 模型池硬边界：秒切候选只在池内
     const available = new Set(filterByPool(availableSelectors(ctx), cfg.pool));
     const filtered = probe ? new Set(probe.filterAvailable([...available])) : available;
-    // 已排除失败者，候选为 filtered 中未冷却的
-    const candidates = [...filtered].filter((s) => !cooldowns.isCooldown(s));
+    // 已排除失败者 + 本链已失败过的模型，候选为 filtered 中未冷却的
+    const candidates = [...filtered].filter((s) => !cooldowns.isCooldown(s) && !failedSet.has(s.toLowerCase()));
     if (candidates.length === 0) {
       ctx.ui.notify(`router: 无可用模型可 fallback（${failedSelector} 失败: ${reason}）`, "error");
       return false;
@@ -164,38 +172,28 @@ export default function (pi: ExtensionAPI) {
       // 若 rank 为空，回退到原 candidates 顺序
       if (ranked.length === 0) ranked = candidates;
     }
-    // 防循环 + 防重复注入：同一条 prompt 在时间窗内只允许自动重试一次。
-    // 注意 key 只用 prompt 本身（不含 failedSelector）——旧实现按「prompt+失败模型」组合计数，
-    // fallback 链 A→B→C 每换一个模型 key 就重置，每成功切换一次就 sendUserMessage 注入一条
-    // 重复的用户消息（持久化进 session、永不撤销），导致「每换一次模型，上一条指令就累加一份」。
-    // 同一失败还可能同时命中 after_provider_response 与 message_end 两个钩子，双倍注入。
-    // 纯 prompt 计数把整条 fallback 链的注入上限压到 1 条；再失败只切模型并提示手动重发。
-    const promptHash = lastPromptText.slice(0, 200);
-    const tries = recentFallbackTries.get(promptHash) ?? 0;
-    if (tries >= 1) {
-      ctx.ui.notify(`router: 同一指令已自动重试过一次，不再重复注入（避免 session 堆积重复消息）。已切换/候选模型见上方提示，请手动重发指令`, "warning");
-      return false;
-    }
-    recentFallbackTries.set(promptHash, tries + 1);
-    setTimeout(() => recentFallbackTries.delete(promptHash), 60_000);
+    // — 核心修复：选模型 + 切模型永远执行；防重护栏只约束 sendUserMessage 重复注入 —
+    // 旧实现把 tries>=1 的 guard 放在选模型之前直接 return false，第二次失败连模型都不切，
+    // 用户手动重发仍打在已耗尽的模型上（volces 429 反复复现的根因）。
     const next = (() => {
       // 同类模型优先（用户核心需求："秒切其他供应商的同类模型"）——
       // volces/dsv4-flash[1m] 耗尽 → 优先 opencode/deepseek-v4-flash / shudie 同款，而非仅凭性价比选 minimax
       const failedBase = normalizeModelBase(failedSelector.split("/").slice(1).join("/"));
       const sameFamily = ranked.filter((s) => {
-        if (s.toLowerCase() === failedSelector.toLowerCase()) return false;
+        if (failedSet.has(s.toLowerCase())) return false;
         return normalizeModelBase(s.split("/").slice(1).join("/")) === failedBase;
       });
       if (sameFamily.length > 0) return sameFamily[0];
-      return ranked.find((s) => s.toLowerCase() !== failedSelector.toLowerCase());
+      return ranked.find((s) => !failedSet.has(s.toLowerCase()));
     })();
     if (!next) {
       ctx.ui.notify(`router: 无其他可用模型可切（${failedSelector} 已排除）`, "warning");
       return false;
     }
-    // 切换模型并静默重试本轮 prompt
+    // 切换模型（无条件执行——保证后续手动重发/下一个 turn 不会落回已故障模型）
     // pi.setModel 期望 model 对象（内部 checkAuth(model.provider)），字符串会失败；
     // 先用 modelRegistry.find 解析为对象，失败再试字符串兼容。
+    let switched = false;
     try {
       let ok = false;
       try {
@@ -205,18 +203,26 @@ export default function (pi: ExtensionAPI) {
         if (modelObj) ok = (await pi.setModel(modelObj as never)) !== false;
       } catch { /* 尝试字符串兼容 */ }
       if (!ok) ok = (await pi.setModel(next as never)) !== false;
-      if (!ok) {
-        ctx.ui.notify(`router: 切换到 ${next} 失败（无权限或找不到）`, "warning");
-        return false;
-      }
-      ctx.ui.notify(`⚡ router: ${failedSelector} 不可用 → 已秒切 ${next} 并重试`, "info");
-      // 静默重试：用 followUp 触发新 turn，重试原始 prompt
-      try { pi.sendUserMessage(lastPromptText, { deliverAs: "followUp" } as never); } catch { /* ignore */ }
-      return true;
-    } catch (e) {
-      ctx.ui.notify(`router: 切换失败 ${String(e).slice(0, 100)}`, "error");
+      switched = ok;
+    } catch { /* switched 保持 false */ }
+    if (!switched) {
+      ctx.ui.notify(`router: 切换到 ${next} 失败（无权限或找不到）`, "warning");
       return false;
     }
+    // 防重复注入：同一条 prompt 在时间窗内只允许自动重试一次（避免 session 堆积重复消息）。
+    // 注意：这里只挡 sendUserMessage 注入，不挡模型切换（上方已完成）；
+    // 同一失败可能同时命中 after_provider_response 与 message_end 两个钩子，此护栏防双倍注入。
+    const tries = recentFallbackTries.get(promptHash) ?? 0;
+    if (tries >= 1) {
+      ctx.ui.notify(`⚡ router: ${failedSelector} 不可用 → 已切到 ${next}。同一指令此前已自动重试过一次（避免 session 堆积重复消息），请直接手动重发`, "info");
+      return true;
+    }
+    recentFallbackTries.set(promptHash, tries + 1);
+    setTimeout(() => recentFallbackTries.delete(promptHash), 60_000);
+    ctx.ui.notify(`⚡ router: ${failedSelector} 不可用 → 已秒切 ${next} 并重试`, "info");
+    // 静默重试：用 followUp 触发新 turn，重试原始 prompt
+    try { pi.sendUserMessage(lastPromptText, { deliverAs: "followUp" } as never); } catch { /* ignore */ }
+    return true;
   }
 
   /** auto-profiling：遍历全部已注册模型，生成画像（含未在 available 的） */

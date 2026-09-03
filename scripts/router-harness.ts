@@ -84,7 +84,10 @@ const FAKE_CONFIG = {
   difficulty: { enabled: false, lowThreshold: 40, highThreshold: 120 },
   selfLearn: { enabled: false, minSamples: 3, decay: 0.9, successWeight: 1, failureWeight: -2, costWeight: 0 },
   probe: { enabled: true, timeoutMs: 300000, probeOnStart: false, excludeUnavailable: true },
-};
+  // 显式空池：bun 的 os.homedir() 不理会 process.env.HOME，会读到真实全局配置；
+  // 若不显式覆盖，真实 pool 会按 key 合并泄漏进来，导致候选过滤依赖运行机器的环境（测试不可复现）
+  pool: [],
+} as Record<string, unknown> & { pool?: string[] };
 
 class Harness {
   private handlers = new Map<string, Handler[]>();

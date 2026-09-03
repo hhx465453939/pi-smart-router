@@ -45,10 +45,13 @@ function fallbackAvailable(
   cacheManager?: CacheManager,
   sessionId?: string,
   promptText?: string,
+  probe?: AvailabilityProbe,
 ): string | undefined {
   const fallback = config.fallback;
   if (!fallback || fallback.mode === "off") return undefined;
-  let chain = (fallback.models ?? []).filter((m) => isAvailable(m, available) && !cooldowns.isCooldown(m));
+  // probe 标记 unavailable（额度耗尽/套餐失效）的模型不进 fallback 链，防止冷却过期后被重新选中
+  const probeOk = (s: string): boolean => !probe || probe.getAvailability(s) !== "unavailable";
+  let chain = (fallback.models ?? []).filter((m) => isAvailable(m, available) && !cooldowns.isCooldown(m) && probeOk(m));
   if (chain.length === 0) return undefined;
   // 缓存感知排序：偏好命中高的模型（仅在 cache.enabled 时）
   if (cacheManager && sessionId && promptText && config.cache?.enabled && config.cache?.preferCache) {
@@ -97,6 +100,9 @@ export function decide(input: DecisionInput): RouteDecision {
     return loss > config.churn.maxChurnTokens;
   };
 
+  // probe 硬检查：markAuthFailure 标记的额度耗尽/套餐失效模型，本 session 任何路径都不可再选
+  const probeOk = (s: string | undefined): boolean => Boolean(s) && (!probe || probe.getAvailability(s as string) !== "unavailable");
+
   // 1. 显式指定：强制，不做冷却规避、不受模型池限制（用户手动意志高于自动路由边界）
   if (features.explicitModel) {
     const sel = features.explicitModel.trim();
@@ -129,7 +135,7 @@ export function decide(input: DecisionInput): RouteDecision {
     const isCacheAware = matched.cacheAware !== false;
     // 若命中模型在冷却，尝试 fallback 链（缓存感知排序）
     if (cooldowns.isCooldown(desired)) {
-      const alt = fallbackAvailable(config, cooldowns, availableModels, isCacheAware ? cacheManager : undefined, sid, prompt);
+      const alt = fallbackAvailable(config, cooldowns, availableModels, isCacheAware ? cacheManager : undefined, sid, prompt, probe);
       if (alt) {
         return { selector: alt, reason: `rule "${matched.id}" hit but "${desired}" cooling → fallback "${alt}"`, ruleId: matched.id, source: "cooldown-avoid", timestamp: now };
       }
@@ -143,7 +149,7 @@ export function decide(input: DecisionInput): RouteDecision {
     if (isAvailable(desired, availableModels)) {
       // probe 标记 unavailable（套餐失效/额度耗尽）→ 不切过去，走 fallback 换供应商同类模型
       if (probe && probe.getAvailability(desired) === "unavailable") {
-        const alt = fallbackAvailable(config, cooldowns, availableModels, isCacheAware ? cacheManager : undefined, sid, prompt);
+        const alt = fallbackAvailable(config, cooldowns, availableModels, isCacheAware ? cacheManager : undefined, sid, prompt, probe);
         if (alt) {
           return { selector: alt, reason: `rule "${matched.id}" → ${desired} unavailable (quota/auth) → fallback "${alt}"`, ruleId: matched.id, source: "cooldown-avoid", timestamp: now, thinkingLevel: matched.thinkingLevel };
         }
@@ -153,7 +159,7 @@ export function decide(input: DecisionInput): RouteDecision {
       return { selector: desired, reason: `rule "${matched.id}" → ${desired}${churnNote(desired)}`, ruleId: matched.id, source: "rule", timestamp: now, thinkingLevel: matched.thinkingLevel };
     }
     // 规则命中但模型不可用 → 尝试 fallback（缓存感知）
-    const alt = fallbackAvailable(config, cooldowns, availableModels, isCacheAware ? cacheManager : undefined, sid, prompt);
+    const alt = fallbackAvailable(config, cooldowns, availableModels, isCacheAware ? cacheManager : undefined, sid, prompt, probe);
     if (alt) {
       return { selector: alt, reason: `rule "${matched.id}" model "${desired}" unavailable → fallback "${alt}"`, ruleId: matched.id, source: "cooldown-avoid", timestamp: now };
     }
@@ -181,7 +187,7 @@ export function decide(input: DecisionInput): RouteDecision {
   // 3. 学习偏好（learn）—— 在粘滞之前，minSamples 门槛
   if (learning && config.learn.enabled) {
     const learned = learning.preferred(features.taskType, config.learn);
-    if (learned && isAvailable(learned, availableModels) && !cooldowns.isCooldown(learned)) {
+    if (learned && isAvailable(learned, availableModels) && !cooldowns.isCooldown(learned) && probeOk(learned)) {
       // churn：若切走会丢缓存且超过阈值，倾向保持当前（保缓存）
       if (shouldKeepForChurn(learned) && current) {
         const loss = estimateChurn(current, learned, cacheManager, sid, prompt);
@@ -194,24 +200,24 @@ export function decide(input: DecisionInput): RouteDecision {
   // 4. 粘滞优先（同 taskType 连续轮次）—— 在 default 之前检查
   if (cacheManager && sid && config.cache?.enabled && config.cache?.sticky) {
     const stickySel = cacheManager.stickyPreferred(features.taskType, config);
-    if (stickySel && isAvailable(stickySel, availableModels) && !cooldowns.isCooldown(stickySel)) {
+    if (stickySel && isAvailable(stickySel, availableModels) && !cooldowns.isCooldown(stickySel) && probeOk(stickySel)) {
       return { selector: stickySel, reason: `sticky ${features.taskType} → ${stickySel} (cache)`, ruleId: undefined, source: "default", timestamp: now };
     }
   }
 
-  // 5. 默认模型（也受冷却 + 可用性约束，fallback 缓存感知）
+  // 5. 默认模型（也受冷却 + probe 不可用约束，fallback 缓存感知）
   if (config.defaultModel) {
     const def = config.defaultModel.trim();
-    if (isAvailable(def, availableModels) && !cooldowns.isCooldown(def)) {
+    if (isAvailable(def, availableModels) && !cooldowns.isCooldown(def) && probeOk(def)) {
       return { selector: def, reason: `default → ${def}`, ruleId: undefined, source: "default", timestamp: now };
     }
     if (cooldowns.isCooldown(def)) {
-      const alt = fallbackAvailable(config, cooldowns, availableModels, cacheManager, sid, prompt);
+      const alt = fallbackAvailable(config, cooldowns, availableModels, cacheManager, sid, prompt, probe);
       if (alt) return { selector: alt, reason: `default "${def}" cooling → fallback "${alt}"`, ruleId: undefined, source: "cooldown-avoid", timestamp: now };
     }
-    if (!isAvailable(def, availableModels)) {
-      const alt = fallbackAvailable(config, cooldowns, availableModels, cacheManager, sid, prompt);
-      if (alt) return { selector: alt, reason: `default "${def}" unavailable → fallback "${alt}"`, ruleId: undefined, source: "cooldown-avoid", timestamp: now };
+    if (!isAvailable(def, availableModels) || !probeOk(def)) {
+      const alt = fallbackAvailable(config, cooldowns, availableModels, cacheManager, sid, prompt, probe);
+      if (alt) return { selector: alt, reason: `default "${def}" unavailable (cooldown/probe) → fallback "${alt}"`, ruleId: undefined, source: "cooldown-avoid", timestamp: now };
     }
   }
 
@@ -234,7 +240,7 @@ export function decide(input: DecisionInput): RouteDecision {
       };
     }
     const avail = pickAvailableModel(plan, cooldowns);
-    if (avail && isAvailable(avail, availableModels)) {
+    if (avail && isAvailable(avail, availableModels) && probeOk(avail)) {
       return { selector: avail, reason: `fallback chain → ${avail}`, ruleId: undefined, source: "default", timestamp: now };
     }
   }
