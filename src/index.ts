@@ -138,7 +138,21 @@ export default function (pi: ExtensionAPI) {
       .replace(/[-_]+$/g, "")
       .trim();
   }
+  /**
+   * 无痛切换入口（防崩壳包装）。本函数由各失败钩子以 fire-and-forget 方式调用，
+   * 异步续体可能在 ctx 失效（session 重建 / fork / reload）后才继续执行，
+   * 此时访问 ctx.ui 会抛 stale-ctx 异常并变成未处理 Promise 拒绝 —— 直接崩掉 pi 进程
+   * （实测：kimi-k3 403 周配额触发秒切时整个 CLI 退出）。这里兜底吞掉，降级为日志。
+   */
   async function tryImmediateFallback(failedSelector: string, ctx: ExtensionContext, reason: string): Promise<boolean> {
+    try {
+      return await tryImmediateFallbackInner(failedSelector, ctx, reason);
+    } catch (e) {
+      try { console.warn(`[pi-smart-router] fallback aborted (${failedSelector}): ${String(e).slice(0, 120)}`); } catch { /* ignore */ }
+      return false;
+    }
+  }
+  async function tryImmediateFallbackInner(failedSelector: string, ctx: ExtensionContext, reason: string): Promise<boolean> {
     const cfg = watcher?.get() ?? loadConfig(ctx.cwd);
     const promptHash = lastPromptText.slice(0, 200);
     // 本条 prompt 的 fallback 链上已失败过的模型：候选永远绕开（换链不走回头路）
