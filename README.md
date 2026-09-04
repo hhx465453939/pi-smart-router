@@ -18,7 +18,7 @@
 
 **self-learn 多维评分** — 按「场景×难度」记录每个模型真实表现，跨会话收敛到「前端→k3、测试→codex、一般→flash」，无需写死规则。
 
-**可用性探测（三层）** — ① 无 key 模型立即排除；② 启动后台异步连通性探测；③ 真实调用捕获 401/402/403/429（套餐失效/欠费/额度耗尽）→ 本 session 排除并秒切同类模型。
+**可用性探测（三层）** — ① 无 key 模型立即排除；② 启动后台异步连通性探测；③ 真实调用捕获 401/402/403/429（套餐失效/欠费/额度耗尽）→ **带 TTL 排除**并秒切同类模型；任何一次真实调用成功立即解除排除（自愈），也可 `/router clear` 手动解除。
 
 **auto-profiling** — 启动时遍历全部已注册模型自动画像（价格/能力/速度档 + 性价比评分），全部自动纳入路由 rank，`/router value` 一眼查看。
 
@@ -92,9 +92,31 @@ cp examples/pi-router.cn.json ~/.pi/agent/pi-router.json
 
 预设与池均存全局 `~/.pi/agent/pi-router.json`，切换热生效，`/router status` 一眼可见当前激活池。
 
-### 无痛秒切 fallback
+### 无痛秒切 fallback（失败闭环）
 
-模型额度耗尽/欠费/超时不再卡死：`message_end` 可靠捕获 429/401/402/403 → 排除该模型 → **优先切其他供应商的同类模型**（`volces/dsv4-flash[1m]` → `opencode-go/deepseek-v4-flash` → `shudie/dsv4`，换供应商不换能力档）→ 静默重发原任务。同类全部不可用再按性价比 rank 兜底。
+模型额度耗尽/欠费/超时不再卡死。一次失败会走完这条闭环，全程无需手动重发指令：
+
+```
+捕获失败（after_provider_response / message_end / tool_result 三路，5s 窗口去重）
+  → 按失败类型带 TTL 排除该模型 + 冷却
+  → 秒切下一个可用模型（优先其他供应商的同类模型：换供应商不换能力档）
+  → 用 custom message 驱动新 turn 续跑本次请求（不伪造用户消息，session 不堆积重复指令）
+  → 若下一个模型也失败，继续推进，同一指令最多 8 次
+  → 池内候选全灭时赦免「最先恢复」的那个模型做最后一搏
+  → 仍无解才进终态：列出排除中/冷却中的模型，并给出 /router clear、/router pool、@model: 三个出口
+```
+
+排除时长按失败类型差异化，到期自动恢复候选资格；**期间任何一次真实调用成功都会立即解除排除与冷却（自愈）**：
+
+| 失败类型 | 排除时长 |
+|---|---|
+| 额度耗尽（`AccountQuotaExceeded` / 连续 429） | 6h（能从报错里解析出重置时间则对齐该时间） |
+| 鉴权/付费失败（401/402/403） | 1h |
+| 无可用通道（503 `model_not_found`） | 1h |
+| 其他 5xx | 10min |
+| 网络不可达 | 5min |
+
+`/router probe` 看当前排除表与剩余恢复时间，`/router status` 的 `excluded` 段同样可见。
 
 ### 显式指定
 
@@ -115,11 +137,11 @@ cp examples/pi-router.cn.json ~/.pi/agent/pi-router.json
 /router learn             — 每 taskType 学习得分
 /router catalog           — 模型能力快照 + self-learn 得分
 /router value [难度]      — 全部模型自动画像性价比排名
-/router probe             — 本 session 可用性探测快照
+/router probe             — 可用性排除表（含剩余恢复时间）
 /router handoff           — 最近交接事件
 /router pool               — 预设管理面板（激活/编辑/重命名/删除/新建，键位见面板）
 /router reload            — 从 pi-router.json 热加载配置
-/router clear [model]     — 清除指定模型或全部冷却
+/router clear [model]     — 解除指定模型或全部的冷却+排除，并复位重试预算
 /router clear-cache       — 清除缓存记录
 /router clear-learn       — 清除学习状态
 /router clear-history     — 清除决策历史
@@ -155,11 +177,14 @@ npm test              # node --test 引擎单测
 npm run typecheck     # tsc --noEmit
 ```
 
-**路由 Harness（e2e fallback 测试能力）**：`scripts/router-harness.ts` 直接驱动扩展、模拟 pi 事件链，本地秒级复现 401/402/403/429 quota 等场景，不依赖真实 LLM：
+**路由 Harness（e2e fallback 测试能力）**：`scripts/router-harness.ts` 直接驱动扩展、模拟 pi 事件链，本地秒级复现 401/402/403/429 quota、级联失败等场景，不依赖真实 LLM。任一断言失败以退出码 1 结束，可直接挂 CI：
 
 ```bash
-timeout 30 node --experimental-strip-types scripts/router-harness.ts        # 复现 429 → 秒切同类 → PASS
-timeout 30 node --experimental-strip-types scripts/router-harness.ts pool-boundary  # 池外模型永不选中
+timeout 40 node --experimental-strip-types scripts/router-harness.ts                   # quota-rule-loop：429 → 秒切同类
+timeout 40 node --experimental-strip-types scripts/router-harness.ts no-channel-503    # 503 无通道 → 排除 + 自动续跑
+timeout 40 node --experimental-strip-types scripts/router-harness.ts dup-injection-guard # 同一次失败命中 4 个钩子只驱动 1 次
+timeout 40 node --experimental-strip-types scripts/router-harness.ts cascade           # 4 个模型连续挂掉，链路一路推进不停摆
+timeout 40 node --experimental-strip-types scripts/router-harness.ts pool-boundary     # 池外模型永不选中
 ```
 
 ## 致谢
