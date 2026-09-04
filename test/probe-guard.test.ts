@@ -1,10 +1,15 @@
 /**
- * probe 硬排除回归测试（429 额度耗尽"秒切后又自动切回"根因修复）
+ * probe 排除回归测试（429 额度耗尽"秒切后又自动切回"根因修复）
  *
- * 场景：volces 模型额度耗尽 → message_end markAuthFailure → probe 标 unavailable。
+ * 场景：volces 模型额度耗尽 → message_end 标 unavailable → probe 排除。
  * 旧版 decide() 只有规则路径和 selfLearn 路径检查 probe，learn / sticky / defaultModel /
  * fallback 链完全不看 probe —— 1 小时冷却一过，耗尽模型又被自动选中，429 反复复现。
  * 修复后：任何选型路径（learn/sticky/default/fallback 链）遇到 probe=unavailable 一律跳过。
+ *
+ * 守护的不变量是「排除生效期间不得 flip-flop 回选死模型」，**不是**「排除永不可逆」。
+ * 排除现在带 TTL（到期自动恢复候选资格），且真实调用成功（markAvailable）可立即自愈 ——
+ * 早期的永久拉黑会让级联失败打穿模型池后整个 session 报废、只能重启 pi，
+ * 见 .debug/fallback-loop-debug.md 的 L2。
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -54,7 +59,7 @@ function exhaustedProbe(c: NormalizedRouterConfig): AvailabilityProbe {
   return probe;
 }
 
-describe("probe-unavailable 硬排除（冷却过期后也不得回选）", () => {
+describe("probe 排除生效期间不得回选（冷却过期也不 flip-flop）", () => {
   it("defaultModel 被标 unavailable → fallback 链接管，不回选耗尽模型", () => {
     const c = cfg();
     const probe = exhaustedProbe(c);
@@ -128,16 +133,48 @@ describe("probe-unavailable 硬排除（冷却过期后也不得回选）", () =
     }
   });
 
-  it("unavailable 标记一经设置本 session 不可逆（markAvailable 不覆盖，防止中途误恢复）", () => {
+  it("排除生效期间不回选；真实调用成功（markAvailable 自愈）后才解除", () => {
     const c = cfg({ defaultModel: VOLCES, fallback: { mode: "model-chain", models: [ALT] } });
     const probe = exhaustedProbe(c);
-    probe.markAvailable(VOLCES); // 即使有代码尝试恢复，额度耗尽标记仍保持
+    const compiled = compileRules(c.rules).compiled;
+    const avail = new Set([VOLCES, ALT]);
+
     assert.equal(probe.getAvailability(VOLCES), "unavailable");
-    const d = decide({
-      features: feat(), config: c, compiledRules: compileRules(c.rules).compiled,
-      cooldowns: new CooldownSet(), availableModels: new Set([VOLCES, ALT]),
-      probe,
+    const before = decide({
+      features: feat(), config: c, compiledRules: compiled,
+      cooldowns: new CooldownSet(), availableModels: avail, probe,
     });
-    assert.notEqual(d.selector, VOLCES);
+    assert.notEqual(before.selector, VOLCES);
+
+    // markAvailable 只应来自真实调用成功（message_end 成功路径），是唯一权威自愈信号
+    probe.markAvailable(VOLCES);
+    assert.equal(probe.getAvailability(VOLCES), "uncertain");
+    const after = decide({
+      features: feat({ currentModel: ALT }), config: c, compiledRules: compiled,
+      cooldowns: new CooldownSet(), availableModels: avail, probe,
+    });
+    assert.equal(after.selector, VOLCES, `恢复后应可回选 defaultModel，实得 ${after.selector} (${after.reason})`);
+  });
+
+  it("排除 TTL 到期后模型自动重新成为候选", async () => {
+    const c = cfg({ defaultModel: VOLCES, fallback: { mode: "model-chain", models: [ALT] } });
+    const probe = new AvailabilityProbe({ config: c.probe, getBaseUrl: () => undefined });
+    probe.markUnavailable(VOLCES, 20, "transient 5xx");
+    const compiled = compileRules(c.rules).compiled;
+    const avail = new Set([VOLCES, ALT]);
+
+    const during = decide({
+      features: feat(), config: c, compiledRules: compiled,
+      cooldowns: new CooldownSet(), availableModels: avail, probe,
+    });
+    assert.notEqual(during.selector, VOLCES);
+
+    await new Promise((r) => setTimeout(r, 40));
+    assert.equal(probe.getAvailability(VOLCES), "uncertain");
+    const after = decide({
+      features: feat({ currentModel: ALT }), config: c, compiledRules: compiled,
+      cooldowns: new CooldownSet(), availableModels: avail, probe,
+    });
+    assert.equal(after.selector, VOLCES, `TTL 到期后应恢复候选资格，实得 ${after.selector} (${after.reason})`);
   });
 });

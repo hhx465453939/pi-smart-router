@@ -19,6 +19,8 @@ export interface RouterCommandDeps {
   clearHistory(): void;
   getCurrentModel(): string | undefined;
   getAvailableModels(): string[];
+  /** probe 排除表（带 TTL）；未启用 probe 时返回空数组 */
+  getExcluded?(): Array<{ selector: string; until: number; remainingMs: number; reason: string }>;
 }
 
 export function formatStatus(deps: RouterCommandDeps): string {
@@ -47,6 +49,11 @@ export function formatStatus(deps: RouterCommandDeps): string {
     for (const c of cds) lines.push(`  - ${c.selector} until ${new Date(c.until).toLocaleTimeString()} — ${c.reason}`);
   } else {
     lines.push("cooldowns: none");
+  }
+  const excluded = deps.getExcluded?.() ?? [];
+  if (excluded.length) {
+    lines.push(`excluded (${excluded.length}) — TTL 到期或成功调用自动恢复，/router clear 可立即解除：`);
+    for (const e of excluded) lines.push(`  ✗ ${e.selector} until ${new Date(e.until).toLocaleTimeString()} — ${e.reason}`);
   }
   if (deps.cacheManager) {
     const recs = deps.cacheManager.getRecords();

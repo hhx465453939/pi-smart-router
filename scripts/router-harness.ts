@@ -1,11 +1,20 @@
 /* eslint-disable */
 // Router Harness: 直接驱动 pi-smart-router 扩展，模拟 pi 事件链，复现 fallback 场景
-// 用法：bun scripts/router-harness.ts <scenario>
+// 用法：node --experimental-strip-types scripts/router-harness.ts <scenario>   （或 bun scripts/router-harness.ts <scenario>）
 //   scenarios:
-//     quota-rule-loop   — volces 额度耗尽 + huge-context 规则反复切回（用户真实 bug）
-//     basic-flow        — 健康路径全跑一遍冒烟
+//     quota-rule-loop    — volces 额度耗尽 + huge-context 规则反复切回（默认）
+//     no-channel-503     — 503 model_not_found 应触发秒切 + 排除 + 自动续跑
+//     dup-injection-guard— 同一次失败命中 4 个钩子，只允许驱动 1 次重试
+//     cascade            — 级联 4 个模型连续挂掉，链路必须一路推进不停摆
+//     pool-boundary      — 池硬边界下的秒切候选
+//
+// 闭环重试的驱动方式是 pi.sendMessage(customType) + triggerTurn，**不是**重发用户 prompt。
+// 因此所有场景都断言 sendUserMessage 调用数为 0（session 里不堆积重复用户指令）。
 
 import type { ExtensionAPI } from "../src/index.ts";
+
+/** src/index.ts 内 RETRY_ENTRY 的字面值（闭包常量，harness 侧只能按字面匹配） */
+const RETRY_CUSTOM_TYPE = "pi-smart-router-retry";
 
 type Handler = (event: unknown, ctx: unknown) => Promise<unknown> | unknown;
 
@@ -95,7 +104,10 @@ class Harness {
   private initialModel = { provider: "volces", id: "deepseek-v4-flash[1m]" };
   private setModel: (sel: string) => Promise<boolean> = async () => false;
   private currentSelector = `${this.initialModel.provider}/${this.initialModel.id}`;
-  private sendMessageCalls: string[] = [];
+  /** pi.sendUserMessage 调用（伪造用户消息）—— 新闭环设计要求恒为 0 */
+  private userMessageCalls: string[] = [];
+  /** pi.sendMessage 调用（custom message 驱动重试）—— 记录 customType 与投递选项 */
+  private sentMessages: Array<{ customType?: string; content: string; triggerTurn: boolean; deliverAs?: string }> = [];
   notifications: string[] = [];
 
   constructor(opts: { initialModel?: { provider: string; id: string } } = {}) {
@@ -151,8 +163,17 @@ class Harness {
       registerShortcut: () => {},
       registerFlag: () => {},
       setModel: this.setModel,
-      sendUserMessage: (text: string, opts?: any) => { this.sendMessageCalls.push(text + (opts?.deliverAs ? ` [${opts.deliverAs}]` : "")); this.notifications.push(`[sendUserMessage] ${text.slice(0, 60)}${text.length > 60 ? "..." : ""}`); },
-      sendMessage: (msg: any) => { this.sendMessageCalls.push(typeof msg === "string" ? msg : (msg?.content ?? "")); this.notifications.push(`[sendMessage] ${typeof msg === "string" ? msg.slice(0,60) : JSON.stringify(msg).slice(0,60)}`); },
+      sendUserMessage: (text: string, opts?: any) => { this.userMessageCalls.push(text); this.notifications.push(`[sendUserMessage] ${text.slice(0, 60)}${text.length > 60 ? "..." : ""}`); },
+      sendMessage: (msg: any, opts?: any) => {
+        const rec = {
+          customType: typeof msg === "string" ? undefined : msg?.customType,
+          content: typeof msg === "string" ? msg : String(msg?.content ?? ""),
+          triggerTurn: Boolean(opts?.triggerTurn),
+          deliverAs: opts?.deliverAs,
+        };
+        this.sentMessages.push(rec);
+        this.notifications.push(`[sendMessage:${rec.customType ?? "?"}] triggerTurn=${rec.triggerTurn} deliverAs=${rec.deliverAs ?? "-"} :: ${rec.content.slice(0, 50)}`);
+      },
       appendEntry: (type: string, data: any) => { /* no-op */ },
       getAgentDir: () => "/tmp/router-harness-agent",
       ui: this.ctx.ui,
@@ -191,7 +212,40 @@ class Harness {
 
   setModel_(selector: string) { this.setModel(selector); }
   getCurrentSelector() { return this.currentSelector; }
-  getSendMessageCalls() { return this.sendMessageCalls; }
+  /** 当前 ctx.model（构造 message_end 失败事件时按真实在跑的模型归因） */
+  getCurrentModel() { return this.ctx.model; }
+  /** 伪造用户消息 —— 新闭环重试不重发 prompt，此值应恒为 0 */
+  getUserMessageCalls() { return this.userMessageCalls; }
+  /** 驱动重试的 custom message（customType = pi-smart-router-retry） */
+  getRetryMessages() { return this.sentMessages.filter((m) => m.customType === RETRY_CUSTOM_TYPE); }
+}
+
+/** 把 FAKE_CONFIG 同时写到 harness cwd 与 HOME，并把 HOME 指过去（各场景共用） */
+async function installConfig(): Promise<void> {
+  const fs = await import("node:fs");
+  const harnessCwd = "/tmp/router-harness";
+  fs.mkdirSync(harnessCwd + "/.pi", { recursive: true });
+  fs.writeFileSync(harnessCwd + "/.pi/pi-router.json", JSON.stringify(FAKE_CONFIG, null, 2));
+  const harnessDir = "/tmp/router-harness-home";
+  fs.mkdirSync(harnessDir + "/.pi/agent", { recursive: true });
+  fs.writeFileSync(harnessDir + "/.pi/agent/pi-router.json", JSON.stringify(FAKE_CONFIG, null, 2));
+  process.env.HOME = harnessDir;
+  process.env.USERPROFILE = harnessDir;
+}
+
+let failures = 0;
+/** 统一断言输出：失败累加计数，最后由 main 决定退出码 */
+function check(label: string, ok: boolean, detail = ""): void {
+  if (!ok) failures++;
+  console.log(`  ${ok ? "✅" : "❌"} ${label}${detail ? ` — ${detail}` : ""}`);
+}
+
+/**
+ * 等 fallback 串行链排空。tryImmediateFallback 是 fire-and-forget：钩子返回时
+ * 切模型已同步完成，但 await 之后的 sendMessage（重试驱动）还在微任务队列里。
+ */
+async function settle(ms = 80): Promise<void> {
+  await new Promise((r) => setTimeout(r, ms));
 }
 
 async function main() {
@@ -199,17 +253,12 @@ async function main() {
   console.log(`=== Router Harness | scenario=${scenario} ===\n`);
 
   if (scenario === "no-channel-503") {
-    // 回归场景：503 model_not_found（new_api_error "No available channel"）应触发秒切 + 长排除。
+    // 回归场景：503 model_not_found（new_api_error "No available channel"）应触发秒切 + 长排除 + 自动续跑。
     // 旧实现 message_end 正则不匹配 503/model_not_found → 无冷却、无切档、指令丢失。
     const harness = new Harness();
     const factory = (await import("../src/index.ts")).default;
     factory(harness.buildApi());
-    const fs = await import("node:fs");
-    const harnessDir = "/tmp/router-harness-home";
-    fs.mkdirSync(harnessDir + "/.pi/agent", { recursive: true });
-    fs.writeFileSync(harnessDir + "/.pi/agent/pi-router.json", JSON.stringify(FAKE_CONFIG, null, 2));
-    process.env.HOME = harnessDir;
-    process.env.USERPROFILE = harnessDir;
+    await installConfig();
 
     await harness.fire("session_start", { reason: "test" });
     const prompt = "分析一下这段配置".repeat(100);
@@ -218,63 +267,114 @@ async function main() {
     await harness.fire("message_end", {
       message: { role: "assistant", stopReason: "error", errorMessage: errText, provider: "volces", model: "deepseek-v4-flash[1m]", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } },
     });
+    await settle();
 
     const finalSel = harness.getCurrentSelector();
-    const injections = harness.getSendMessageCalls().filter((c) => c.includes(prompt.slice(0, 20))).length;
+    const retries = harness.getRetryMessages();
     console.log(`  最终模型: ${finalSel}`);
     console.log(`\n=== 断言 ===`);
-    const ok = finalSel !== "volces/deepseek-v4-flash[1m]" && injections === 1;
-    console.log(`  已秒切（期望非 volces）: ${finalSel !== "volces/deepseek-v4-flash[1m]" ? "✅" : "❌"}`);
-    console.log(`  重试注入次数（期望 1）: ${injections} ${injections === 1 ? "✅" : "❌"}`);
-    if (!ok) process.exit(1);
+    check("已秒切离故障模型", finalSel !== "volces/deepseek-v4-flash[1m]", finalSel);
+    check("未伪造用户消息（不重发 prompt）", harness.getUserMessageCalls().length === 0, `${harness.getUserMessageCalls().length} 次`);
+    check("恰好一条重试驱动（custom message）", retries.length === 1, `${retries.length} 条`);
+    check("重试驱动带 triggerTurn", retries.every((r) => r.triggerTurn), retries.map((r) => `triggerTurn=${r.triggerTurn}`).join(","));
     console.log(`\n=== 最近 6 条通知 ===`);
     for (const n of harness.notifications.slice(-6)) console.log("  " + n);
     return;
   }
 
   if (scenario === "dup-injection-guard") {
-    // 回归场景：fallback 链 + 双钩子 + tool_result 四重触发，断言 sendUserMessage 全链只注入 1 次。
-    // 旧实现（key=prompt+failedSelector，阈值 3）在这个场景会注 3+ 条重复用户指令。
+    // 回归场景：一次失败会同时命中 after_provider_response(429×2) / message_end / tool_result 四个钩子。
+    // 守护的不变量：① 绝不伪造用户消息（旧实现重发 prompt，链路越长 session 里重复指令越多，
+    //   commit 00801d3 为此把自动重试砍到 1 次，代价是停摆）；② 同一故障模型只驱动一次重试。
+    // 已知风险（见 .debug/fallback-loop-debug.md 待追踪问题）：tool_result 钩子按"当前模型"归因，
+    //   秒切之后到达的 tool_result 会算到新模型头上，因此本场景允许 2 个不同 driver。
     const harness = new Harness();
     const factory = (await import("../src/index.ts")).default;
     factory(harness.buildApi());
-
-    const fs = await import("node:fs");
-    const harnessDir = "/tmp/router-harness-home";
-    fs.mkdirSync(harnessDir + "/.pi/agent", { recursive: true });
-    fs.writeFileSync(harnessDir + "/.pi/agent/pi-router.json", JSON.stringify(FAKE_CONFIG, null, 2));
-    process.env.HOME = harnessDir;
-    process.env.USERPROFILE = harnessDir;
+    await installConfig();
 
     await harness.fire("session_start", { reason: "test" });
     const prompt = "请分析这份长文档".repeat(200);
     await harness.fire("before_agent_start", { prompt, images: [], systemPromptOptions: { selectedTools: ["bash", "edit"] } });
 
-    // 触发 1+2：连续 429 ×2 → n>=2 → tryImmediateFallback → setModel + sendUserMessage(注入 #1)
+    // 触发 1+2：连续 429 ×2 → n>=2 → tryImmediateFallback（driver #1: volces）
     await harness.fire("after_provider_response", { status: 429, headers: {} });
     await harness.fire("after_provider_response", { status: 429, headers: {} });
     const afterChainSwitch = harness.getCurrentSelector();
 
-    // 触发 3：message_end 同一轮失败（同一 prompt）→ 应被纯 prompt 计数拦住
+    // 触发 3：message_end 同一轮失败，payload 显式带 volces → 应被去重拦住
     await harness.fire("message_end", {
       message: { role: "assistant", stopReason: "error", errorMessage: 'Retry failed: 429 AccountQuotaExceeded', provider: "volces", model: "deepseek-v4-flash[1m]", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } },
     });
 
-    // 触发 4：tool_result 额度耗尽 → 同样应被拦住
+    // 触发 4：tool_result 额度耗尽（归因到当前模型 = 已切换后的模型）
     await harness.fire("tool_result", { isError: true, content: [{ type: "text", text: "Error: AccountQuotaExceeded — quota exceeded" }] });
+    await settle();
 
-    const calls = harness.getSendMessageCalls();
-    const injections = calls.filter((c) => c.includes(prompt.slice(0, 40))).length;
+    const retries = harness.getRetryMessages();
+    const drivers = retries.map((r) => (r.content.match(/上一个模型 (\S+) 不可用/) ?? [])[1]).filter(Boolean);
+    const dupDrivers = drivers.filter((d, i) => drivers.indexOf(d) !== i);
     console.log(`  fallback 链首次切换后模型: ${afterChainSwitch}`);
-    console.log(`  message_end + tool_result 二次触发后 sendUserMessage 总数: ${calls.length}`);
+    console.log(`  重试 driver 序列: ${drivers.join(" → ") || "(无)"}`);
     console.log(`\n=== 断言 ===`);
-    console.log(`  重复指令注入次数（期望 1）: ${injections} ${injections === 1 ? "✅ PASS" : "❌ FAIL"}`);
-    if (injections !== 1) {
-      for (const c of calls) console.log(`    call: ${c.slice(0, 80)}...`);
-      process.exit(1);
-    }
+    check("未伪造用户消息（不重发 prompt）", harness.getUserMessageCalls().length === 0, `${harness.getUserMessageCalls().length} 次`);
+    check("同一故障模型不重复驱动重试", dupDrivers.length === 0, dupDrivers.join(","));
+    check("首次触发即完成秒切", afterChainSwitch !== "volces/deepseek-v4-flash[1m]", afterChainSwitch);
+    check("每条重试驱动都带 triggerTurn", retries.length > 0 && retries.every((r) => r.triggerTurn), `${retries.length} 条`);
     console.log(`\n=== 最近 10 条通知 ===`);
     for (const n of harness.notifications.slice(-10)) console.log("  " + n);
+    return;
+  }
+
+  if (scenario === "cascade") {
+    // 回归场景（用户真实故障）：连续 4 个模型挨个挂掉，router 必须一路推进到活模型。
+    // 旧实现在第 2 次失败后只切模型不驱动 turn → 对话停摆，用户必须手动重发指令，
+    // 且候选耗尽后死模型被留在原位继续挨打（.debug/fallback-loop-debug.md L1/L2）。
+    FAKE_CONFIG.pool = FAKE_MODELS.map((m) => `${m.provider}/${m.id}`);
+    const harness = new Harness();
+    const factory = (await import("../src/index.ts")).default;
+    factory(harness.buildApi());
+    await installConfig();
+
+    await harness.fire("session_start", { reason: "test" });
+    const prompt = "请分析这份长文档".repeat(200);
+    await harness.fire("before_agent_start", { prompt, images: [], systemPromptOptions: { selectedTools: ["bash", "edit"] } });
+
+    const failures: Array<{ label: string; errorMessage: string }> = [
+      { label: "额度耗尽 429", errorMessage: 'Retry failed after 3 attempts: 429 {"error":{"code":"AccountQuotaExceeded","message":"You have exceeded the monthly usage quota"}}' },
+      { label: "套餐失效 403", errorMessage: 'Retry failed after 3 attempts: 403 {"error":{"message":"Forbidden — plan expired"}}' },
+      { label: "无可用通道 503", errorMessage: 'Retry failed after 3 attempts: 503 {"error":{"code":"model_not_found","message":"No available channel"}}' },
+      { label: "限流 429", errorMessage: "Retry failed after 3 attempts: 429 TooManyRequests" },
+    ];
+
+    const visited: string[] = [harness.getCurrentSelector()];
+    for (let i = 0; i < failures.length; i++) {
+      const cur = harness.getCurrentModel();
+      await harness.fire("message_end", {
+        message: { role: "assistant", stopReason: "error", provider: cur.provider, model: cur.id, errorMessage: failures[i].errorMessage, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } },
+      });
+      await settle();
+      // 闭环驱动的新 turn：prompt 为空（followUp 不携带用户输入）
+      await harness.fire("before_agent_start", { prompt: "", images: [], systemPromptOptions: { selectedTools: ["bash", "edit"] } });
+      const sel = harness.getCurrentSelector();
+      visited.push(sel);
+      console.log(`[失败${i + 1}] ${failures[i].label} → 模型 = ${sel}`);
+    }
+
+    const retries = harness.getRetryMessages();
+    const drivers = retries.map((r) => (r.content.match(/上一个模型 (\S+) 不可用/) ?? [])[1]).filter(Boolean);
+    const distinct = new Set(visited);
+    console.log(`\n  模型轨迹: ${visited.join(" → ")}`);
+    console.log(`  重试 driver 数: ${retries.length}（失败 ${failures.length} 次）`);
+    console.log(`\n=== 断言 ===`);
+    check("每次失败都驱动了一次重试（无停摆）", retries.length === failures.length, `${retries.length}/${failures.length}`);
+    check("未伪造用户消息（不重发 prompt）", harness.getUserMessageCalls().length === 0, `${harness.getUserMessageCalls().length} 次`);
+    check("链路一路向前，不回头撞已死模型", distinct.size === visited.length, `访问 ${visited.length} 次 / 不同 ${distinct.size} 个`);
+    check("driver 序列无重复", new Set(drivers).size === drivers.length, drivers.join(" → "));
+    check("最终停在非 volces 模型", harness.getCurrentSelector() !== "volces/deepseek-v4-flash[1m]", harness.getCurrentSelector());
+    console.log(`\n=== 最近 12 条通知 ===`);
+    for (const n of harness.notifications.slice(-12)) console.log("  " + n);
+    FAKE_CONFIG.pool = [];
     return;
   }
 
@@ -288,23 +388,7 @@ async function main() {
   const api = harness.buildApi();
   // 加载扩展（factory 接收 pi ExtensionAPI）
   factory(api);
-
-  // 覆写 loadConfig/getConfig 让扩展用我们的假配置
-  // 简化：直接修改 cfg 走默认 → 我们注入 dummy pi-router.json 让 loadConfig 读它
-  // 但 config.ts 用 homedir + ~/.pi/agent/pi-router.json；harness 里 cwd=/tmp，让 config 读 /tmp/.pi/pi-router.json
-  // 先写一份 fake 配置到 harness cwd
-  const fs = await import("node:fs");
-  // 配置写入与 FakeCtx.cwd 匹配的路径（/tmp/router-harness/.pi/pi-router.json），使 watcher 真正读到 FAKE_CONFIG
-  const harnessCwd = "/tmp/router-harness";
-  fs.mkdirSync(harnessCwd + "/.pi", { recursive: true });
-  fs.writeFileSync(harnessCwd + "/.pi/pi-router.json", JSON.stringify(FAKE_CONFIG, null, 2));
-  // 同时写一份到 HOME（global 路径），双保险
-  const harnessDir = "/tmp/router-harness-home";
-  fs.mkdirSync(harnessDir + "/.pi/agent", { recursive: true });
-  fs.writeFileSync(harnessDir + "/.pi/agent/pi-router.json", JSON.stringify(FAKE_CONFIG, null, 2));
-  // 改 HOME 让 config 找 harness cwd
-  process.env.HOME = harnessDir;
-  process.env.USERPROFILE = harnessDir;
+  await installConfig();
 
   console.log("[1] session_start");
   await harness.fire("session_start", { reason: "test" });
@@ -316,7 +400,6 @@ async function main() {
     systemPromptOptions: { selectedTools: ["bash", "edit"] },
   });
   console.log(`    current=${harness.getCurrentSelector()}`);
-  console.log(`    setModel calls=${harness.getSendMessageCalls().length}`);
 
   console.log("\n[3] after_provider_response x3 (volces 429 quota × 3，模拟 pi retry)");
   for (let i = 0; i < 3; i++) {
@@ -343,23 +426,24 @@ async function main() {
   console.log(`    decisions: ${JSON.stringify(decisions, null, 2)}`);
 
   // 断言
+  await settle();
   const finalSel = harness.getCurrentSelector();
-  const expected = "opencode/deepseek-v4-flash";
+  const retries = harness.getRetryMessages();
   console.log(`\n=== 断言 ===`);
   console.log(`  最终模型: ${finalSel}`);
-  console.log(`  期望非 volces（应切到 ${expected} 或 fallback 链中其它）: ${finalSel !== "volces/deepseek-v4-flash[1m]" ? "✅ PASS" : "❌ FAIL"}`);
-  console.log(`  setMessage 重发调用次数=${harness.getSendMessageCalls().length}`);
-  if (harness.getSendMessageCalls().length > 0) {
-    console.log(`  重发内容（首条）: ${harness.getSendMessageCalls()[0].slice(0,80)}...`);
-  }
+  check("已切离耗尽模型", finalSel !== "volces/deepseek-v4-flash[1m]", finalSel);
+  check("未伪造用户消息（不重发 prompt）", harness.getUserMessageCalls().length === 0, `${harness.getUserMessageCalls().length} 次`);
+  check("重试驱动带 triggerTurn", retries.every((r) => r.triggerTurn), `${retries.length} 条`);
 
   console.log(`\n=== 最近 20 条通知 ===`);
   for (const n of harness.notifications.slice(-20)) console.log("  " + n);
 }
 
-main().catch((e) => { console.error("HARNESS ERR:", e); process.exit(1); });
-// probe 后台探测 timer 会挂住事件循环，必须显式退出
-setTimeout(() => process.exit(0), 500).unref?.();
+function report(): void {
+  console.log(`\n=== 结果：${failures === 0 ? "✅ 全部通过" : `❌ ${failures} 项失败`} ===`);
+  process.exitCode = failures === 0 ? 0 : 1;
+  // probe 后台探测 timer 会挂住事件循环，必须显式退出（带上失败计数，别用 exit(0) 掩盖红）
+  setTimeout(() => process.exit(failures === 0 ? 0 : 1), 300).unref?.();
+}
 
-// 部署建议：在 CI / 本地开发时用此脚本验证扩展链路
-// 后续可拓展：multi-fallback exhaustion 场景、规则循环重置场景等
+main().then(report).catch((e) => { console.error("HARNESS ERR:", e); failures++; report(); });

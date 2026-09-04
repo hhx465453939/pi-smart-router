@@ -15,14 +15,14 @@ import { LearningManager } from "./engine/learn.ts";
 import { compileRules, type CompiledRule } from "./engine/rules.ts";
 import { resolveTurnDecision } from "./hooks/agent.ts";
 import { resolveProviderDecision } from "./hooks/provider.ts";
-import { onProviderResponse, onToolResult, isQuotaExceeded } from "./hooks/failure.ts";
+import { onProviderResponse, onToolResult, isQuotaExceeded, parseQuotaResetMs } from "./hooks/failure.ts";
 import { formatRules, formatStatus } from "./commands/router.ts";
 import { PoolPickerComponent, NamePromptComponent, PresetManagerComponent, type PresetManagerAction, type PoolItem, type PresetItem, type PickerTheme } from "./tui/multipick.ts";
 import { buildRouterTool } from "./tool/router.ts";
 import { classifyTaskType } from "./context/task.ts";
 import { ModelCatalog } from "./catalog/catalog.ts";
 import { SelfLearnManager } from "./engine/selflearn.ts";
-import { AvailabilityProbe } from "./probe/availability.ts";
+import { AvailabilityProbe, PROBE_TTL } from "./probe/availability.ts";
 import { analyzeTask } from "./engine/difficulty.ts";
 import { profileModel, rankModels, valueScore, type ModelProfile, type RegistryModel } from "./engine/profile.ts";
 import type { Difficulty } from "./types.ts";
@@ -49,6 +49,8 @@ export default function (pi: ExtensionAPI) {
   const DECISION_ENTRY = "pi-smart-router-decision";
   const CACHE_ENTRY = "pi-smart-router-cache";
   const LEARN_ENTRY = "pi-smart-router-learn";
+  /** 闭环重试用的 custom message 类型（参与 LLM 上下文，但不伪造用户消息） */
+  const RETRY_ENTRY = "pi-smart-router-retry";
   const MAX_HISTORY = 50;
 
   function classifyGuess(prompt: string): string {
@@ -124,11 +126,68 @@ export default function (pi: ExtensionAPI) {
     } catch { return undefined; }
   }
 
-  // 无痛切换：按当前场景/难度 rank 逐个试下一个可用模型，直至成功
-  const recentFallbackTries = new Map<string, number>();
-  // 同一条 prompt 的 fallback 链上已失败过的模型 —— 候选永远绕开，避免 A→B 后 B 又失败切回 A
+  /**
+   * 单条指令的自动重试链路预算。
+   * 旧实现是"同一 prompt 只允许自动重试 1 次"（tries >= 1 就只切模型、不再驱动 turn），
+   * 目的是防 session 堆积重复用户消息 —— 代价是第 2 个模型再失败时对话直接停摆，
+   * 用户必须手动重发，且死模型被留在原位继续挨打（见 .debug/fallback-loop-debug.md L1）。
+   * 现在重试改用 custom message（参与上下文但不伪造用户消息），可以放心给足预算把链路走完。
+   */
+  const MAX_CHAIN_ATTEMPTS = 8;
+  /** promptHash → 已自动重试次数（链路预算） */
+  const chainAttempts = new Map<string, number>();
+  /** 已用过"全灭赦免"的 promptHash —— 每条指令只赦免一次，避免 A↔B 反复对撞 */
+  const amnestyUsed = new Set<string>();
+  /** 失败事件去重：同一次失败会同时命中 after_provider_response 与 message_end 两个钩子 */
+  const recentFailureEvents = new Map<string, number>();
+  const FAILURE_DEDUP_MS = 5_000;
+  // 同一条 prompt 的 fallback 链上已失败过的模型 —— 候选绕开，避免 A→B 后 B 又失败切回 A
   const recentFallbackFails = new Map<string, Set<string>>();
   const rateLimit429Count = new Map<string, number>();
+  /** fallback 串行队列：并发调用按到达顺序执行，杜绝双重切换 / 双重注入 */
+  let fallbackChain: Promise<unknown> = Promise.resolve();
+
+  function fmtWait(ms: number): string {
+    if (ms >= 3600_000) return `${(ms / 3600_000).toFixed(1)}h`;
+    if (ms >= 60_000) return `${Math.round(ms / 60_000)}min`;
+    return `${Math.max(1, Math.round(ms / 1000))}s`;
+  }
+
+  /** 同一次失败的重复上报（双钩子竞态）→ 只处理第一次 */
+  function isDuplicateFailure(key: string): boolean {
+    const now = Date.now();
+    const prev = recentFailureEvents.get(key);
+    if (prev !== undefined && now - prev < FAILURE_DEDUP_MS) return true;
+    recentFailureEvents.set(key, now);
+    setTimeout(() => { if (recentFailureEvents.get(key) === now) recentFailureEvents.delete(key); }, FAILURE_DEDUP_MS);
+    return false;
+  }
+
+  /** 从全池中挑"最先恢复"的模型作为赦免对象（冷却与 probe 排除叠加时取较晚恢复者） */
+  function pickAmnesty(universe: string[]): { selector: string; waitMs: number } | undefined {
+    if (universe.length === 0) return undefined;
+    const probeRemaining = new Map(
+      (probe?.excluded() ?? []).map((e) => [e.selector.trim().toLowerCase(), e.remainingMs] as const),
+    );
+    const scored = universe.map((s) => ({
+      selector: s,
+      waitMs: Math.max(cooldowns.remainingMs(s), probeRemaining.get(s.trim().toLowerCase()) ?? 0),
+    }));
+    scored.sort((a, b) => a.waitMs - b.waitMs);
+    return scored[0];
+  }
+
+  /** 终态：链路预算耗尽或池内确实无候选 —— 明确告知下一步，而不是无声停摆 */
+  function notifyTerminal(ctx: ExtensionContext, failedSelector: string, reason: string, attempts: number): void {
+    const lines = [`router: 自动切换已终止 — ${failedSelector} 失败（${reason}），已尝试 ${attempts}/${MAX_CHAIN_ATTEMPTS} 次。`];
+    const excluded = probe?.excluded() ?? [];
+    if (excluded.length) lines.push(`  排除中：${excluded.slice(0, 6).map((e) => `${e.selector}(${fmtWait(e.remainingMs)})`).join(", ")}`);
+    const cooling = cooldowns.all();
+    if (cooling.length) lines.push(`  冷却中：${cooling.slice(0, 6).map((c) => `${c.selector}(${fmtWait(c.until - Date.now())})`).join(", ")}`);
+    lines.push("  下一步：/router clear 解除全部冷却与排除后重发；或 /router pool 把死模型移出池；或 @model:<selector> 强制指定。");
+    ctx.ui.notify(lines.join("\n"), "error");
+  }
+
   /** 归一化 model id 到家族基准：去 provider 前缀、小写、去 [1m]/-0731 等变体后缀，使跨供应商同款可匹配 */
   function normalizeModelBase(id: string): string {
     return id
@@ -138,35 +197,73 @@ export default function (pi: ExtensionAPI) {
       .replace(/[-_]+$/g, "")
       .trim();
   }
+
   /**
-   * 无痛切换入口（防崩壳包装）。本函数由各失败钩子以 fire-and-forget 方式调用，
-   * 异步续体可能在 ctx 失效（session 重建 / fork / reload）后才继续执行，
-   * 此时访问 ctx.ui 会抛 stale-ctx 异常并变成未处理 Promise 拒绝 —— 直接崩掉 pi 进程
-   * （实测：kimi-k3 403 周配额触发秒切时整个 CLI 退出）。这里兜底吞掉，降级为日志。
+   * 无痛切换入口（串行队列 + 防崩壳）。本函数由各失败钩子以 fire-and-forget 方式调用：
+   * - 串行：同一次失败会同时命中 after_provider_response 与 message_end，并发执行会双重切换 + 双重注入。
+   * - 防崩壳：异步续体可能在 ctx 失效（session 重建 / fork / reload）后才继续执行，
+   *   此时访问 ctx.ui 会抛 stale-ctx 异常并变成未处理 Promise 拒绝 —— 直接崩掉 pi 进程
+   *   （实测：kimi-k3 403 周配额触发秒切时整个 CLI 退出）。这里兜底吞掉，降级为日志。
    */
-  async function tryImmediateFallback(failedSelector: string, ctx: ExtensionContext, reason: string): Promise<boolean> {
-    try {
-      return await tryImmediateFallbackInner(failedSelector, ctx, reason);
-    } catch (e) {
-      try { console.warn(`[pi-smart-router] fallback aborted (${failedSelector}): ${String(e).slice(0, 120)}`); } catch { /* ignore */ }
-      return false;
-    }
+  function tryImmediateFallback(failedSelector: string, ctx: ExtensionContext, reason: string): Promise<boolean> {
+    const run = fallbackChain
+      .then(() => tryImmediateFallbackInner(failedSelector, ctx, reason))
+      .catch((e) => {
+        try { console.warn(`[pi-smart-router] fallback aborted (${failedSelector}): ${String(e).slice(0, 120)}`); } catch { /* ignore */ }
+        return false;
+      });
+    fallbackChain = run.then(() => {}, () => {});
+    return run;
   }
+
   async function tryImmediateFallbackInner(failedSelector: string, ctx: ExtensionContext, reason: string): Promise<boolean> {
     const cfg = watcher?.get() ?? loadConfig(ctx.cwd);
     const promptHash = lastPromptText.slice(0, 200);
-    // 本条 prompt 的 fallback 链上已失败过的模型：候选永远绕开（换链不走回头路）
+    // 双钩子竞态去重：同一次失败只推进一次链路
+    if (isDuplicateFailure(`${promptHash}::${failedSelector.trim().toLowerCase()}`)) {
+      if (cfg.verbose) console.log(`[pi-smart-router] dedup: ${failedSelector} 同一失败重复上报，跳过`);
+      return false;
+    }
+    // 本条 prompt 的 fallback 链上已失败过的模型：候选绕开（换链不走回头路）
     const failedSet = recentFallbackFails.get(promptHash) ?? new Set<string>();
-    failedSet.add(failedSelector.toLowerCase());
+    failedSet.add(failedSelector.trim().toLowerCase());
     recentFallbackFails.set(promptHash, failedSet);
     setTimeout(() => recentFallbackFails.delete(promptHash), 10 * 60_000);
+
+    // 链路预算：走完 MAX_CHAIN_ATTEMPTS 仍失败 → 进终态，给用户可执行指引
+    const attempts = (chainAttempts.get(promptHash) ?? 0) + 1;
+    chainAttempts.set(promptHash, attempts);
+    setTimeout(() => { chainAttempts.delete(promptHash); amnestyUsed.delete(promptHash); }, 10 * 60_000);
+    if (attempts > MAX_CHAIN_ATTEMPTS) {
+      notifyTerminal(ctx, failedSelector, reason, attempts - 1);
+      return false;
+    }
+
     // 模型池硬边界：秒切候选只在池内
     const available = new Set(filterByPool(availableSelectors(ctx), cfg.pool));
-    const filtered = probe ? new Set(probe.filterAvailable([...available])) : available;
-    // 已排除失败者 + 本链已失败过的模型，候选为 filtered 中未冷却的
-    const candidates = [...filtered].filter((s) => !cooldowns.isCooldown(s) && !failedSet.has(s.toLowerCase()));
+    const usableNow = (s: string): boolean =>
+      !cooldowns.isCooldown(s) && !failedSet.has(s.trim().toLowerCase()) && (!probe || probe.getAvailability(s) !== "unavailable");
+    let candidates = [...available].filter(usableNow);
+
+    // 全灭赦免：池内一个可用候选都没有 → 解除"最先恢复"那个模型的冷却/排除，最后一搏。
+    // 旧实现在这里只 notify 然后 return false，把死模型留在原位，之后每个请求继续撞在它身上。
     if (candidates.length === 0) {
-      ctx.ui.notify(`router: 无可用模型可 fallback（${failedSelector} 失败: ${reason}）`, "error");
+      const failedLower = failedSelector.trim().toLowerCase();
+      const pardonUniverse = [...available].filter((s) => {
+        const k = s.trim().toLowerCase();
+        return k !== failedLower && !failedSet.has(k);
+      });
+      const pardon = pickAmnesty(pardonUniverse);
+      if (pardon && !amnestyUsed.has(promptHash)) {
+        amnestyUsed.add(promptHash);
+        cooldowns.clear(pardon.selector);
+        probe?.clear(pardon.selector);
+        candidates = [pardon.selector];
+        ctx.ui.notify(`⚡ router: 池内候选全灭 → 赦免 ${pardon.selector}（原本 ${fmtWait(pardon.waitMs)} 后恢复）最后一搏`, "warning");
+      }
+    }
+    if (candidates.length === 0) {
+      notifyTerminal(ctx, failedSelector, reason, attempts);
       return false;
     }
     // 按当前场景/难度 rank 排序候选
@@ -186,25 +283,22 @@ export default function (pi: ExtensionAPI) {
       // 若 rank 为空，回退到原 candidates 顺序
       if (ranked.length === 0) ranked = candidates;
     }
-    // — 核心修复：选模型 + 切模型永远执行；防重护栏只约束 sendUserMessage 重复注入 —
-    // 旧实现把 tries>=1 的 guard 放在选模型之前直接 return false，第二次失败连模型都不切，
-    // 用户手动重发仍打在已耗尽的模型上（volces 429 反复复现的根因）。
     const next = (() => {
       // 同类模型优先（用户核心需求："秒切其他供应商的同类模型"）——
       // volces/dsv4-flash[1m] 耗尽 → 优先 opencode/deepseek-v4-flash / shudie 同款，而非仅凭性价比选 minimax
       const failedBase = normalizeModelBase(failedSelector.split("/").slice(1).join("/"));
       const sameFamily = ranked.filter((s) => {
-        if (failedSet.has(s.toLowerCase())) return false;
+        if (failedSet.has(s.trim().toLowerCase())) return false;
         return normalizeModelBase(s.split("/").slice(1).join("/")) === failedBase;
       });
       if (sameFamily.length > 0) return sameFamily[0];
-      return ranked.find((s) => !failedSet.has(s.toLowerCase()));
+      return ranked.find((s) => !failedSet.has(s.trim().toLowerCase()));
     })();
     if (!next) {
-      ctx.ui.notify(`router: 无其他可用模型可切（${failedSelector} 已排除）`, "warning");
+      notifyTerminal(ctx, failedSelector, reason, attempts);
       return false;
     }
-    // 切换模型（无条件执行——保证后续手动重发/下一个 turn 不会落回已故障模型）
+    // 切换模型（无条件执行——保证后续重试/下一个 turn 不会落回已故障模型）
     // pi.setModel 期望 model 对象（内部 checkAuth(model.provider)），字符串会失败；
     // 先用 modelRegistry.find 解析为对象，失败再试字符串兼容。
     let switched = false;
@@ -223,19 +317,18 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify(`router: 切换到 ${next} 失败（无权限或找不到）`, "warning");
       return false;
     }
-    // 防重复注入：同一条 prompt 在时间窗内只允许自动重试一次（避免 session 堆积重复消息）。
-    // 注意：这里只挡 sendUserMessage 注入，不挡模型切换（上方已完成）；
-    // 同一失败可能同时命中 after_provider_response 与 message_end 两个钩子，此护栏防双倍注入。
-    const tries = recentFallbackTries.get(promptHash) ?? 0;
-    if (tries >= 1) {
-      ctx.ui.notify(`⚡ router: ${failedSelector} 不可用 → 已切到 ${next}。同一指令此前已自动重试过一次（避免 session 堆积重复消息），请直接手动重发`, "info");
-      return true;
-    }
-    recentFallbackTries.set(promptHash, tries + 1);
-    setTimeout(() => recentFallbackTries.delete(promptHash), 60_000);
-    ctx.ui.notify(`⚡ router: ${failedSelector} 不可用 → 已秒切 ${next} 并重试`, "info");
-    // 静默重试：用 followUp 触发新 turn，重试原始 prompt
-    try { pi.sendUserMessage(lastPromptText, { deliverAs: "followUp" } as never); } catch { /* ignore */ }
+    ctx.ui.notify(`⚡ router: ${failedSelector} 不可用（${reason}）→ 已秒切 ${next} 并自动重试 [${attempts}/${MAX_CHAIN_ATTEMPTS}]`, "info");
+    // 闭环驱动：custom message + triggerTurn 触发新 turn。
+    // 不用 sendUserMessage —— 那会把指令再伪造一条用户消息，链路越长 session 里重复指令越多
+    // （commit 00801d3 正为此把自动重试砍到 1 次，结果换来了停摆）。
+    // custom message 参与 LLM 上下文但不是用户消息，既能驱动 turn 又不堆积重复指令。
+    try {
+      pi.sendMessage({
+        customType: RETRY_ENTRY,
+        content: `[pi-smart-router] 上一个模型 ${failedSelector} 不可用（${reason}），已切换到 ${next}。请接着完成用户最后一条请求，不要重复已经完成的步骤，也不要向用户复述本条提示。`,
+        display: true,
+      }, { triggerTurn: true, deliverAs: "followUp" });
+    } catch { /* ignore */ }
     return true;
   }
 
@@ -386,12 +479,18 @@ export default function (pi: ExtensionAPI) {
     const availableFiltered = probe ? new Set(probe.filterAvailable([...available])) : available;
     const sid = sessionIdOf(ctx);
     const promptText = (event as unknown as { prompt?: string }).prompt ?? "";
-    lastPromptText = promptText;
-    lastTaskType = (event as unknown as { systemPromptOptions?: { taskType?: string } }).systemPromptOptions?.taskType ?? classifyGuess(promptText);
+    // 仅在拿到真实用户 prompt 时更新：闭环重试 / 工具续轮触发的 turn 没有 prompt，
+    // 若被空串覆盖会冲掉 promptHash（链路预算被重置 → 无限重试）并丢失缓存跟踪文本。
+    if (promptText) {
+      lastPromptText = promptText;
+      lastTaskType = (event as unknown as { systemPromptOptions?: { taskType?: string } }).systemPromptOptions?.taskType ?? classifyGuess(promptText);
+    }
+    // 本轮无 prompt（重试/工具续轮）时回落到上一条真实指令，保证路由与缓存跟踪仍按真实任务文本走
+    const effectivePrompt = promptText || lastPromptText;
     // auto-rank：按当前难度把画像好的模型并入候选（让 fallback 层能自动选到，无需手写规则）
     if (cfg.difficulty.enabled && profiles.length) {
       const { difficulty } = analyzeTask(
-        { taskType: lastTaskType as never, toolNames: [], contextTokens: contextTokens(ctx), messageCount: messageCount(ctx), turnIndex, promptLength: promptText.length, hasImage: false, explicitModel: undefined, currentModel: cur, thinkingLevel: undefined, promptText },
+        { taskType: lastTaskType as never, toolNames: [], contextTokens: contextTokens(ctx), messageCount: messageCount(ctx), turnIndex, promptLength: effectivePrompt.length, hasImage: false, explicitModel: undefined, currentModel: cur, thinkingLevel: undefined, promptText: effectivePrompt },
         cfg.difficulty.lowThreshold,
         cfg.difficulty.highThreshold,
       );
@@ -411,7 +510,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     const rec = resolveTurnDecision({
-      prompt: promptText,
+      prompt: effectivePrompt,
       images: (event as unknown as { images?: unknown[] }).images as unknown[] | undefined,
       systemPromptOptions: (event as unknown as { systemPromptOptions?: { selectedTools?: string[] } }).systemPromptOptions as { selectedTools?: string[] } | undefined,
       currentModelSelector: cur,
@@ -536,12 +635,12 @@ export default function (pi: ExtensionAPI) {
         try { pi.appendEntry(LEARN_ENTRY, { taskType, selector: sel, success: false, timestamp: Date.now() } as never); } catch { /* ignore */ }
       }
     }
-    // 可用性：401/402/403 → 套餐失效/欠费，标记本 session 不可用 + 无痛秒切
+    // 可用性：401/402/403 → 套餐失效/欠费，带 TTL 排除 + 无痛秒切
     if (cfg.probe.enabled && (event.status === 401 || event.status === 402 || event.status === 403)) {
       const sel = currentSelector(ctx);
       if (sel && probe) {
-        probe.markAuthFailure(sel);
-        ctx.ui.notify(`⚡ router: ${sel} auth failed (HTTP ${event.status}) — excluded this session`, "warning");
+        probe.markUnavailable(sel, PROBE_TTL.auth, `HTTP ${event.status} auth/payment`);
+        ctx.ui.notify(`⚡ router: ${sel} auth failed (HTTP ${event.status}) — 排除 ${fmtWait(PROBE_TTL.auth)}，成功调用或 /router clear 可提前恢复`, "warning");
         void tryImmediateFallback(sel, ctx, `HTTP ${event.status}`);
       }
     }
@@ -553,9 +652,9 @@ export default function (pi: ExtensionAPI) {
         rateLimit429Count.set(sel, n);
         // 同一模型连续 2 次 429（pi 内部 retry 也会触发多次）→ 视为额度耗尽而非瞬时限流
         if (n >= 2) {
-          probe.markAuthFailure(sel);
-          cooldowns.add(sel, 60 * 60 * 1000, `429×${n} quota/rate exhausted`);
-          ctx.ui.notify(`⚡ router: ${sel} 连续 ${n} 次 429 — 本 session 排除，秒切其他供应商`, "warning");
+          probe.markUnavailable(sel, PROBE_TTL.quota, `429×${n} quota/rate exhausted`);
+          cooldowns.add(sel, PROBE_TTL.quota, `429×${n} quota/rate exhausted`);
+          ctx.ui.notify(`⚡ router: ${sel} 连续 ${n} 次 429 — 排除 ${fmtWait(PROBE_TTL.quota)}，秒切其他供应商`, "warning");
           rateLimit429Count.delete(sel);
           void tryImmediateFallback(sel, ctx, "429 rate/quota exhausted");
         } else {
@@ -600,12 +699,21 @@ export default function (pi: ExtensionAPI) {
         // 泛 5xx 服务端故障——可能瞬时恢复，短冷却 + 秒切重试一次
         const is5xx = /\b(500|502|503|504)\b|internal.?server|bad.?gateway|service.?unavailable/i.test(errText);
         if (errSel && cfg0.enabled && (isAuth || isQuota || is429 || isNoChannel || is5xx)) {
-          const permanent = isAuth || isQuota || isNoChannel; // 无通道/套餐/额度 → 本 session 排除；429/5xx 瞬时 → 仅冷却
-          if (permanent && probe) probe.markAuthFailure(errSel);
-          cooldowns.add(errSel, permanent ? 60 * 60 * 1000 : 10 * 60 * 1000, `api_error: ${errText.slice(0, 80)}`);
+          // 按失败类型给差异化排除时长：额度耗尽对齐真实重置时间（解析不到回落 6h），
+          // 无通道/套餐失效 1h；429/5xx 可能瞬时恢复 → 只冷却不排除
+          const exclude = isAuth || isQuota || isNoChannel;
+          const ttl = isQuota ? (parseQuotaResetMs(errText) ?? PROBE_TTL.quota)
+            : isNoChannel ? PROBE_TTL.noChannel
+            : isAuth ? PROBE_TTL.auth
+            : PROBE_TTL.server;
+          const cooldownMs = exclude ? ttl : PROBE_TTL.server;
+          const why = `api_error: ${errText.slice(0, 80)}`;
+          if (exclude && probe) probe.markUnavailable(errSel, ttl, why);
+          cooldowns.add(errSel, cooldownMs, why);
           const kind = isNoChannel ? "模型无通道（503 model_not_found）"
             : isQuota ? "额度耗尽" : isAuth ? "套餐失效" : is429 ? "429 限流" : "5xx 服务故障";
-          ctx.ui.notify(`⚡ router: ${errSel} API 失败（${kind}）— 本 session 排除，秒切其他供应商`, "error");
+          const span = exclude ? `排除 ${fmtWait(ttl)}` : `冷却 ${fmtWait(cooldownMs)}`;
+          ctx.ui.notify(`⚡ router: ${errSel} API 失败（${kind}）— ${span}，秒切其他供应商`, "error");
           void tryImmediateFallback(errSel, ctx, isNoChannel ? "model_not_found" : isQuota ? "quota exceeded" : isAuth ? "auth failed" : is429 ? "429" : "5xx server error");
           return; // 失败轮不记录缓存/学习
         }
@@ -616,6 +724,12 @@ export default function (pi: ExtensionAPI) {
       if (!sel) return;
       const sid = sessionIdOf(ctx);
       const usage = msg.usage;
+      // 自愈：真实调用成功是解除排除/冷却的唯一权威信号（额度重置、套餐续费、瞬时 5xx 恢复都靠它）。
+      // 用消息自带的 provider/model —— pi 内部重试后 ctx.model 可能已不是实际服务该消息的模型。
+      const okSel = msg.provider && msg.model ? `${msg.provider}/${msg.model}` : sel;
+      if (probe) probe.markAvailable(okSel);
+      cooldowns.clear(okSel);
+      rateLimit429Count.delete(okSel);
       if (cfg.cache.enabled) {
         cacheManager.recordUsage(sel, sid, lastPromptText, { cacheRead: usage.cacheRead ?? 0, cacheWrite: usage.cacheWrite ?? 0 });
         // 持久化一条轻量 cache 记录（便于 /router status 展示与恢复）
@@ -676,8 +790,9 @@ export default function (pi: ExtensionAPI) {
       return "";
     })();
     if (isQuotaExceeded(contentText) && sel && probe) {
-      probe.markAuthFailure(sel);
-      ctx.ui.notify(`⚡ router: "${sel}" quota exceeded — excluded from rank until next session`, "error");
+      const ttl = parseQuotaResetMs(contentText) ?? PROBE_TTL.quota;
+      probe.markUnavailable(sel, ttl, "quota exceeded");
+      ctx.ui.notify(`⚡ router: "${sel}" quota exceeded — 排除 ${fmtWait(ttl)}（额度重置或成功调用后自动恢复，/router clear 可立即解除）`, "error");
       void tryImmediateFallback(sel, ctx, "quota exceeded");
     }
     onToolResult(
@@ -708,7 +823,7 @@ export default function (pi: ExtensionAPI) {
 
   // ——— /router 命令 ———
   pi.registerCommand("router", {
-    description: "pi-smart-router: status / rules / reload / clear-cooldown / toggle / test / cache / learn / pool (预设管理面板，键位见面板)",
+    description: "pi-smart-router: status / rules / probe / reload / clear / toggle / test / cache / learn / pool (预设管理面板，键位见面板)",
     handler: async (args, ctx) => {
       const raw = String(args ?? "").trim();
       const [sub, ...rest] = raw.split(/\s+/).filter(Boolean);
@@ -729,6 +844,7 @@ export default function (pi: ExtensionAPI) {
         clearHistory: () => { history = []; },
         getCurrentModel: () => currentSelector(ctx as unknown as ExtensionContext),
         getAvailableModels: () => [...availableSelectors(ctx as unknown as ExtensionContext)],
+        getExcluded: () => probe?.excluded() ?? [],
       };
 
       if (cmd === "status" || cmd === "st" || cmd === "") {
@@ -929,12 +1045,16 @@ export default function (pi: ExtensionAPI) {
       }
       if (cmd === "probe") {
         if (!probe) { ctx.ui.notify("probe not initialized", "warning"); return; }
+        const excluded = probe.excluded();
         const snap = probe.getSnapshot();
-        const entries = Object.entries(snap);
-        if (!entries.length) { ctx.ui.notify(probe.isRunning() ? "probe: running in background..." : "probe: no targets yet", "info"); return; }
-        const unavail = entries.filter(([, v]) => v === "unavailable");
-        const lines = [`probe: ${entries.length} targets (${probe.isRunning() ? "running" : "done"}), ${unavail.length} unavailable`];
-        for (const [k, v] of entries) if (v === "unavailable") lines.push(`  ✗ ${k}`);
+        const total = Object.keys(snap).length;
+        if (!excluded.length) {
+          ctx.ui.notify(probe.isRunning() ? "probe: running in background... 当前无排除" : `probe: ${total} targets，当前无排除`, "info");
+          return;
+        }
+        const lines = [`probe: ${excluded.length} 个模型排除中（到期自动恢复候选资格），${total} targets`];
+        for (const e of excluded) lines.push(`  ✗ ${e.selector} — ${fmtWait(e.remainingMs)} 后恢复 — ${e.reason}`);
+        lines.push("  解除：/router clear <model> 或 /router clear（全部）");
         ctx.ui.notify(lines.join("\n"), "info");
         return;
       }
@@ -950,11 +1070,25 @@ export default function (pi: ExtensionAPI) {
       if (cmd === "clear-cooldown" || cmd === "clear") {
         const target = rest.join(" ").trim();
         if (target) {
-          const ok = cooldowns.clear(target);
-          ctx.ui.notify(ok ? `cleared cooldown: ${target}` : `no cooldown for: ${target}`, ok ? "info" : "warning");
+          const okCool = cooldowns.clear(target);
+          const okProbe = probe?.clear(target) ?? false;
+          // 单个模型复位后，允许它重新参与本条指令的链路（清掉"已失败"与"已赦免"记录）
+          for (const set of recentFallbackFails.values()) set.delete(target.trim().toLowerCase());
+          const ok = okCool || okProbe;
+          ctx.ui.notify(
+            ok ? `已解除 ${target} 的${okCool ? "冷却" : ""}${okCool && okProbe ? " + " : ""}${okProbe ? "排除" : ""}` : `${target} 当前无冷却/排除`,
+            ok ? "info" : "warning",
+          );
         } else {
           cooldowns.clearAll();
-          ctx.ui.notify("all cooldowns cleared", "info");
+          probe?.clearAll();
+          // 链路状态一并复位，否则预算已耗尽的指令 clear 后重发会立刻进终态
+          chainAttempts.clear();
+          amnestyUsed.clear();
+          recentFallbackFails.clear();
+          recentFailureEvents.clear();
+          rateLimit429Count.clear();
+          ctx.ui.notify("已解除全部冷却与排除，链路预算已复位 —— 可直接重发指令", "info");
         }
         return;
       }
@@ -1049,12 +1183,12 @@ export default function (pi: ExtensionAPI) {
           "  /router learn           — 每任务类型学习得分（taskType→model 分数）",
           "  /router catalog         — 模型能力快照 + 自适应得分",
           "  /router value [low|medium|high] — 全量模型性价比排名（自动画像）",
-          "  /router probe           — 本 session 可用性（连通性/套餐失效排除）",
+          "  /router probe           — 可用性排除表（连通性/套餐失效，带剩余恢复时间）",
           "  /router handoff         — 最近模型交接事件",
           "",
           "维护操作：",
           "  /router reload          — 热重载 pi-router.json（改配置后用）",
-          "  /router clear [model]   — 清除某模型或全部冷却",
+          "  /router clear [model]   — 解除某模型或全部的冷却+排除，并复位重试预算",
           "  /router clear-cache     — 清空缓存记录",
           "  /router clear-learn     — 清空学习状态",
           "  /router clear-history   — 清空决策历史",
@@ -1062,7 +1196,12 @@ export default function (pi: ExtensionAPI) {
           "",
           "配置：全局 ~/.pi/agent/pi-router.json  项目级 .pi/pi-router.json（覆盖全局）",
           "  模板：examples/pi-router.cn.json（中文生态，开箱即用）",
-          "  额度耗尽（AccountQuotaExceeded 429）会自动从 rank 排除至下次会话",
+          "",
+          "失败自动闭环（无需手动重发指令）：",
+          "  额度耗尽/鉴权失败 → 带 TTL 排除（额度 6h、鉴权 1h、无渠道 1h、5xx 10min、网络 5min）",
+          "  → 立即秒切下一个可用模型并自动续跑本次请求（同一指令最多 8 次）",
+          "  → 候选全灭时赦免「最先恢复者」；仍无解才提示终态并给出手动出口",
+          "  任何一次真实调用成功都会立即解除该模型的排除与冷却（自愈）",
           "",
           "示例：@model:openai/gpt-5.1 强制指定本次模型（绕过路由）",
         ].join("\n"), "info");

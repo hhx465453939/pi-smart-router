@@ -80,6 +80,13 @@ export class CooldownSet {
     return this.get(selector) !== undefined;
   }
 
+  /** 冷却剩余毫秒数；未在冷却返回 0（供"候选全灭时赦免最先恢复者"排序用） */
+  remainingMs(selector: string): number {
+    const entry = this.get(selector);
+    if (!entry) return 0;
+    return Math.max(0, entry.until - Date.now());
+  }
+
   /** 当前所有有效冷却（含已清理过期项） */
   all(): CooldownEntry[] {
     const now = Date.now();

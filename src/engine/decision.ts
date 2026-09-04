@@ -1,8 +1,17 @@
 /**
  * 决策引擎（PolicyEngine 语义）
  *
- * 优先级：显式指定 > 冷却规避 > 规则 > defaultModel > 保持当前
+ * 优先级：显式指定 > 规则 > selfLearn > learn > 粘滞 > defaultModel > fallback 链
+ *        > 池内兜底扫描 > 全灭赦免 > 保持当前
  * 提炼自 CCR 的多策略优先级 + fallback 链。
+ *
+ * 闭环不变量：**任何路径都不得返回一个不可用的模型**。
+ * 可用性由统一的 `usable()` 门禁判定（候选集合内 + 未冷却 + 未被 probe 排除）。
+ * 早期实现有三处漏洞会让 router 撞墙停摆（详见 .debug/fallback-loop-debug.md 的 L3）：
+ * ① 规则目标冷却且 fallback 链为空时，直接把冷却中的死模型返回；
+ * ② pool 只当"过滤器"，从不当"候选来源"，池内其余健康模型永不被兜底；
+ * ③ 候选耗尽后返回 undefined（= 保持当前），而当前往往正是那个死模型 → 每轮撞墙。
+ * 现在 ② 由池内兜底扫描解决，③ 由赦免（解除最先恢复者的排除）解决。
  */
 import type { NormalizedRouterConfig, RouteDecision, TaskFeatures, RouterRule } from "../types.ts";
 import { CooldownSet } from "./registry.ts";
@@ -100,8 +109,89 @@ export function decide(input: DecisionInput): RouteDecision {
     return loss > config.churn.maxChurnTokens;
   };
 
-  // probe 硬检查：markAuthFailure 标记的额度耗尽/套餐失效模型，本 session 任何路径都不可再选
+  // probe 排除（额度耗尽/套餐失效）：任何路径都不可再选，直到 TTL 到期或真实调用成功自愈
   const probeOk = (s: string | undefined): boolean => Boolean(s) && (!probe || probe.getAvailability(s as string) !== "unavailable");
+
+  /** 统一可用性门禁 —— 所有选型路径共用，杜绝"把死模型返回给调用方" */
+  const usable = (s: string | undefined): boolean =>
+    Boolean(s) && isAvailable(s, availableModels) && !cooldowns.isCooldown(s as string) && probeOk(s);
+
+  /**
+   * 当前模型已死（不在候选集合 / 冷却中 / 被 probe 排除）→ 必须换，否则每轮都撞在它身上。
+   * 池内兜底扫描与赦免都以此为闸门：当前健康时不打扰（含用户手动选的池外模型）。
+   */
+  const currentDead = Boolean(current) && !usable(current);
+
+  /** 有序候选宇宙：defaultModel → fallback.models → 池内其余。pool 既是边界也是兜底来源。 */
+  const orderedUniverse = (): string[] => {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    const push = (s: string | undefined): void => {
+      const trimmed = s?.trim();
+      if (!trimmed) return;
+      const k = trimmed.toLowerCase();
+      if (seen.has(k) || !isAvailable(trimmed, availableModels)) return;
+      seen.add(k);
+      out.push(trimmed);
+    };
+    push(config.defaultModel);
+    for (const m of config.fallback.models ?? []) push(m);
+    for (const m of availableModels) push(m);
+    return out;
+  };
+
+  /** 缓存感知排序（cm 传 undefined 表示该路径不做缓存优化，如 rule.cacheAware === false） */
+  const rankByCache = (candidates: string[], cm: CacheManager | undefined = cacheManager): string[] => {
+    if (candidates.length < 2) return candidates;
+    if (cm && sid && prompt && config.cache?.enabled && config.cache?.preferCache) {
+      return cm.rankCandidates(candidates, sid, prompt, config);
+    }
+    return candidates;
+  };
+
+  /** 池内兜底扫描：fallback 链耗尽后，从池内其余健康模型里挑一个（缓存感知排序） */
+  const poolSweep = (cm: CacheManager | undefined = cacheManager): string | undefined => {
+    if (!currentDead) return undefined;
+    const candidates = orderedUniverse().filter(usable);
+    if (candidates.length === 0) return undefined;
+    return rankByCache(candidates, cm)[0];
+  };
+
+  /**
+   * 全灭赦免（最后一搏）：池内没有任何可用模型时，解除"最先恢复"那个模型的冷却/排除并推进。
+   * 不赦免就只能停摆等用户手动把模型从 pool 里删掉（旧行为，见 .debug L2/L3）。
+   * 重试次数由调用方的链路预算兜住，不会无限循环。
+   */
+  const amnesty = (): { selector: string; waitMs: number } | undefined => {
+    if (!currentDead) return undefined;
+    const universe = orderedUniverse();
+    if (universe.length === 0) return undefined;
+    const probeRemaining = new Map(
+      (probe?.excluded() ?? []).map((e) => [e.selector.trim().toLowerCase(), e.remainingMs] as const),
+    );
+    let best: string | undefined;
+    let bestWait = Infinity;
+    const currentKey = current?.trim().toLowerCase();
+    for (const sel of universe) {
+      if (usable(sel)) continue;
+      // 不赦免 current 本身：它就是刚失败/正在冷却的那个，原地重试等于 flip-flop
+      if (currentKey && sel.trim().toLowerCase() === currentKey) continue;
+      // 冷却与 probe 排除可能叠加，取两者中较晚恢复的时间作为"代价"
+      const wait = Math.max(cooldowns.remainingMs(sel), probeRemaining.get(sel.toLowerCase()) ?? 0);
+      if (wait < bestWait) { bestWait = wait; best = sel; }
+    }
+    if (!best) return undefined;
+    cooldowns.clear(best);
+    probe?.clear(best);
+    return { selector: best, waitMs: bestWait };
+  };
+
+  /** 说明某个模型为什么不可用（写进 reason，便于用户判断） */
+  const unusableWhy = (sel: string): string => {
+    if (!isAvailable(sel, availableModels)) return poolSet ? "unavailable (outside pool)" : "unavailable";
+    if (cooldowns.isCooldown(sel)) return `cooling ${Math.round(cooldowns.remainingMs(sel) / 1000)}s`;
+    return "unavailable (quota/auth)";
+  };
 
   // 1. 显式指定：强制，不做冷却规避、不受模型池限制（用户手动意志高于自动路由边界）
   if (features.explicitModel) {
@@ -110,15 +200,6 @@ export function decide(input: DecisionInput): RouteDecision {
       return { selector: sel, reason: `explicit @${config.explicitModelPrefix}${sel}`, ruleId: undefined, source: "explicit", timestamp: now };
     }
     return { selector: undefined, reason: `explicit model "${sel}" not available`, ruleId: undefined, source: "explicit", timestamp: now };
-  }
-
-  // 1.5 粘滞优化：同 taskType 连续轮次保持同一模型以保缓存（仅当无高优规则且非显式时）
-  if (cacheManager && sid && config.cache?.enabled && config.cache?.sticky) {
-    const stickySel = cacheManager.stickyPreferred(features.taskType, config);
-    if (stickySel && isAvailable(stickySel, availableModels) && !cooldowns.isCooldown(stickySel)) {
-      // 粘滞仅在“无规则命中或规则优先级低”时生效；这里先记录，规则命中后仍优先规则
-      // 若后续无规则命中，粘滞将作为 default 候选
-    }
   }
 
   // 2. 规则命中（池感知：目标模型在池外的规则被跳过，继续找下一条可用的）
@@ -132,64 +213,50 @@ export function decide(input: DecisionInput): RouteDecision {
   }
   if (matched) {
     const desired = matched.model.trim();
-    const isCacheAware = matched.cacheAware !== false;
-    // 若命中模型在冷却，尝试 fallback 链（缓存感知排序）
-    if (cooldowns.isCooldown(desired)) {
-      const alt = fallbackAvailable(config, cooldowns, availableModels, isCacheAware ? cacheManager : undefined, sid, prompt, probe);
-      if (alt) {
-        return { selector: alt, reason: `rule "${matched.id}" hit but "${desired}" cooling → fallback "${alt}"`, ruleId: matched.id, source: "cooldown-avoid", timestamp: now };
-      }
-      // 冷却但无 fallback 可用，仍返回原命中并由调用方决定是否保持当前
-      if (isAvailable(desired, availableModels)) {
-        return { selector: desired, reason: `rule "${matched.id}" hit → "${desired}" (cooling, no fallback)`, ruleId: matched.id, source: "rule", timestamp: now, thinkingLevel: matched.thinkingLevel };
-      }
-      return { selector: undefined, reason: `rule "${matched.id}" hit but model "${desired}" unavailable/cooling`, ruleId: matched.id, source: "rule", timestamp: now };
-    }
-
-    if (isAvailable(desired, availableModels)) {
-      // probe 标记 unavailable（套餐失效/额度耗尽）→ 不切过去，走 fallback 换供应商同类模型
-      if (probe && probe.getAvailability(desired) === "unavailable") {
-        const alt = fallbackAvailable(config, cooldowns, availableModels, isCacheAware ? cacheManager : undefined, sid, prompt, probe);
-        if (alt) {
-          return { selector: alt, reason: `rule "${matched.id}" → ${desired} unavailable (quota/auth) → fallback "${alt}"`, ruleId: matched.id, source: "cooldown-avoid", timestamp: now, thinkingLevel: matched.thinkingLevel };
-        }
-        return { selector: undefined, reason: `rule "${matched.id}" → ${desired} unavailable, no fallback`, ruleId: matched.id, source: "rule", timestamp: now };
-      }
+    // rule.cacheAware === false 表示该规则不参与缓存优化排序（如强制特定能力模型）
+    const cm = matched.cacheAware !== false ? cacheManager : undefined;
+    if (usable(desired)) {
       // 规则命中：尊重规则（即便 churn 大，规则优先）；reason 标注 churn；带 thinkingLevel
       return { selector: desired, reason: `rule "${matched.id}" → ${desired}${churnNote(desired)}`, ruleId: matched.id, source: "rule", timestamp: now, thinkingLevel: matched.thinkingLevel };
     }
-    // 规则命中但模型不可用 → 尝试 fallback（缓存感知）
-    const alt = fallbackAvailable(config, cooldowns, availableModels, isCacheAware ? cacheManager : undefined, sid, prompt, probe);
+    const why = unusableWhy(desired);
+    // 逐级兜底：fallback 链 → 池内扫描 → 赦免。任何一级命中都返回可用模型，绝不返回死模型。
+    const alt = fallbackAvailable(config, cooldowns, availableModels, cm, sid, prompt, probe);
     if (alt) {
-      return { selector: alt, reason: `rule "${matched.id}" model "${desired}" unavailable → fallback "${alt}"`, ruleId: matched.id, source: "cooldown-avoid", timestamp: now };
+      return { selector: alt, reason: `rule "${matched.id}" → ${desired} ${why} → fallback "${alt}"`, ruleId: matched.id, source: "cooldown-avoid", timestamp: now, thinkingLevel: matched.thinkingLevel };
     }
-    return { selector: undefined, reason: `rule "${matched.id}" model "${desired}" unavailable`, ruleId: matched.id, source: "rule", timestamp: now };
+    const swept = poolSweep(cm);
+    if (swept) {
+      return { selector: swept, reason: `rule "${matched.id}" → ${desired} ${why} → pool sweep "${swept}"`, ruleId: matched.id, source: "pool-sweep", timestamp: now, thinkingLevel: matched.thinkingLevel };
+    }
+    const pardon = amnesty();
+    if (pardon) {
+      return { selector: pardon.selector, reason: `rule "${matched.id}" → ${desired} ${why}; pool exhausted → pardoned "${pardon.selector}" (recovering in ${Math.round(pardon.waitMs / 1000)}s)`, ruleId: matched.id, source: "amnesty", timestamp: now, thinkingLevel: matched.thinkingLevel };
+    }
+    return { selector: undefined, reason: `rule "${matched.id}" → ${desired} ${why}, no usable candidate`, ruleId: matched.id, source: "rule", timestamp: now };
   }
 
   // 2.5 self-learn 自适应（场景×难度）—— 无规则命中时，用学到的"最适合模型"
   if (selfLearn && config.selfLearn.enabled && config.difficulty.enabled) {
     const { difficulty, scenario } = analyzeTask(features, config.difficulty.lowThreshold, config.difficulty.highThreshold);
     const learned = selfLearn.best(scenario, difficulty);
-    if (learned && isAvailable(learned, availableModels) && !cooldowns.isCooldown(learned)) {
-      const probeOk = probe ? probe.getAvailability(learned) !== "unavailable" : true;
-      if (probeOk) {
-        // churn：若切走丢缓存超阈值，倾向保持
-        if (shouldKeepForChurn(learned) && current) {
-          const loss = estimateChurn(current, learned, cacheManager, sid, prompt);
-          return { selector: current, reason: `selfLearn→${learned} but churn≈${loss}tok; keep ${current}`, ruleId: undefined, source: "keep", timestamp: now };
-        }
-        return { selector: learned, reason: `selfLearn[${scenario}/${difficulty}] → ${learned}${churnNote(learned)}`, ruleId: undefined, source: "default", timestamp: now };
+    if (learned && usable(learned)) {
+      // churn：若切走丢缓存超阈值且当前模型健康，倾向保持
+      if (shouldKeepForChurn(learned) && !currentDead) {
+        const loss = estimateChurn(current, learned, cacheManager, sid, prompt);
+        return { selector: current, reason: `selfLearn→${learned} but churn≈${loss}tok; keep ${current}`, ruleId: undefined, source: "keep", timestamp: now };
       }
+      return { selector: learned, reason: `selfLearn[${scenario}/${difficulty}] → ${learned}${churnNote(learned)}`, ruleId: undefined, source: "default", timestamp: now };
     }
-    // 无 self-learn 命中时，低/中难度默认回落到便宜模型（fallback 链兜底在步骤 6）
+    // 无 self-learn 命中时，低/中难度默认回落到便宜模型（兜底在步骤 6/6.5）
   }
 
   // 3. 学习偏好（learn）—— 在粘滞之前，minSamples 门槛
   if (learning && config.learn.enabled) {
     const learned = learning.preferred(features.taskType, config.learn);
-    if (learned && isAvailable(learned, availableModels) && !cooldowns.isCooldown(learned) && probeOk(learned)) {
-      // churn：若切走会丢缓存且超过阈值，倾向保持当前（保缓存）
-      if (shouldKeepForChurn(learned) && current) {
+    if (learned && usable(learned)) {
+      // churn：若切走会丢缓存且超过阈值，倾向保持当前（保缓存）；当前已死则必须切
+      if (shouldKeepForChurn(learned) && !currentDead) {
         const loss = estimateChurn(current, learned, cacheManager, sid, prompt);
         return { selector: current, reason: `learn→${learned} but churn≈${loss}tok > ${config.churn.maxChurnTokens}; keep ${current} (cache)`, ruleId: undefined, source: "keep", timestamp: now };
       }
@@ -200,24 +267,20 @@ export function decide(input: DecisionInput): RouteDecision {
   // 4. 粘滞优先（同 taskType 连续轮次）—— 在 default 之前检查
   if (cacheManager && sid && config.cache?.enabled && config.cache?.sticky) {
     const stickySel = cacheManager.stickyPreferred(features.taskType, config);
-    if (stickySel && isAvailable(stickySel, availableModels) && !cooldowns.isCooldown(stickySel) && probeOk(stickySel)) {
+    if (usable(stickySel)) {
       return { selector: stickySel, reason: `sticky ${features.taskType} → ${stickySel} (cache)`, ruleId: undefined, source: "default", timestamp: now };
     }
   }
 
-  // 5. 默认模型（也受冷却 + probe 不可用约束，fallback 缓存感知）
+  // 5. 默认模型（同样受 usable() 门禁约束，不可用则走 fallback 链）
   if (config.defaultModel) {
     const def = config.defaultModel.trim();
-    if (isAvailable(def, availableModels) && !cooldowns.isCooldown(def) && probeOk(def)) {
+    if (usable(def)) {
       return { selector: def, reason: `default → ${def}`, ruleId: undefined, source: "default", timestamp: now };
     }
-    if (cooldowns.isCooldown(def)) {
-      const alt = fallbackAvailable(config, cooldowns, availableModels, cacheManager, sid, prompt, probe);
-      if (alt) return { selector: alt, reason: `default "${def}" cooling → fallback "${alt}"`, ruleId: undefined, source: "cooldown-avoid", timestamp: now };
-    }
-    if (!isAvailable(def, availableModels) || !probeOk(def)) {
-      const alt = fallbackAvailable(config, cooldowns, availableModels, cacheManager, sid, prompt, probe);
-      if (alt) return { selector: alt, reason: `default "${def}" unavailable (cooldown/probe) → fallback "${alt}"`, ruleId: undefined, source: "cooldown-avoid", timestamp: now };
+    const alt = fallbackAvailable(config, cooldowns, availableModels, cacheManager, sid, prompt, probe);
+    if (alt) {
+      return { selector: alt, reason: `default "${def}" ${unusableWhy(def)} → fallback "${alt}"`, ruleId: undefined, source: "cooldown-avoid", timestamp: now };
     }
   }
 
@@ -239,12 +302,33 @@ export function decide(input: DecisionInput): RouteDecision {
         }),
       };
     }
-    const avail = pickAvailableModel(plan, cooldowns);
-    if (avail && isAvailable(avail, availableModels) && probeOk(avail)) {
-      return { selector: avail, reason: `fallback chain → ${avail}`, ruleId: undefined, source: "default", timestamp: now };
+    // 逐个尝试判定可用性：旧实现只取"第一个未冷却"的再单独判 probe，
+    // 首个被 probe 排除时整条链就被放弃（链中后续健康模型漏选）
+    const avail = pickAvailableModel(plan, cooldowns, (s) => isAvailable(s, availableModels) && probeOk(s));
+    if (avail) {
+      return { selector: avail, reason: `fallback chain → ${avail}${churnNote(avail)}`, ruleId: undefined, source: "default", timestamp: now };
     }
   }
 
-  // 7. 保持当前
+  // 6.5 池内兜底扫描：default + fallback 链全灭，但池内还有健康模型（用户配置的链往往远小于池）
+  {
+    const swept = poolSweep();
+    if (swept) {
+      return { selector: swept, reason: `default/fallback exhausted → pool sweep "${swept}"${churnNote(swept)}`, ruleId: undefined, source: "pool-sweep", timestamp: now };
+    }
+  }
+
+  // 6.6 全灭赦免：池内一个可用的都没有 → 解除最先恢复者的排除，强行推进而不是停摆
+  {
+    const pardon = amnesty();
+    if (pardon) {
+      return { selector: pardon.selector, reason: `pool exhausted → pardoned "${pardon.selector}" (was recovering in ${Math.round(pardon.waitMs / 1000)}s)`, ruleId: undefined, source: "amnesty", timestamp: now };
+    }
+  }
+
+  // 7. 保持当前（仅在当前健康、或确实无任何候选时到达）
+  if (currentDead) {
+    return { selector: undefined, reason: `current "${current}" unusable and no candidate in pool`, ruleId: undefined, source: "keep", timestamp: now };
+  }
   return { selector: undefined, reason: "keep current (no routing decision)", ruleId: undefined, source: "keep", timestamp: now };
 }

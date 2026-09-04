@@ -271,7 +271,7 @@ export interface RouteDecision {
   /** 命中规则 id（若有） */
   ruleId: string | undefined;
   /** 决策来源 */
-  source: "explicit" | "cooldown-avoid" | "rule" | "default" | "keep";
+  source: "explicit" | "cooldown-avoid" | "rule" | "default" | "pool-sweep" | "amnesty" | "keep";
   /** 决策时间戳 */
   timestamp: number;
   /** 命中规则建议的思考级别（若有，切换模型后应用） */

@@ -73,8 +73,8 @@ function truncate(s: string, n: number): string {
   return s.length > n ? s.slice(0, n) + "…" : s;
 }
 
-/** 解析额度重置时间，返回距今毫秒数，未能解析返回 null */
-function parseQuotaResetMs(text: string): number | null {
+/** 解析额度重置时间，返回距今毫秒数，未能解析返回 null（供 probe 排除 TTL 对齐真实重置时间） */
+export function parseQuotaResetMs(text: string): number | null {
   // 匹配 "reset at 2026-09-06 23:59:59 +0800 CST" 等
   const m = text.match(/reset at\s+([\d-]+\s+[\d:]+\s*[+\-]\d+[^\n]*)/i);
   if (!m) return null;

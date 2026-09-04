@@ -75,12 +75,22 @@ export function createExecutionPlan(input: {
 }
 
 /**
- * 从执行计划中选出第一个未冷却的可用模型
+ * 从执行计划中选出第一个可用的模型
+ *
+ * `extraOk` 用于叠加冷却之外的可用性条件（probe 排除、池归属等）。
+ * 必须由本函数逐个尝试判定：若先取"第一个未冷却"的再让调用方单独校验，
+ * 链首被 probe 排除时整条链就会被放弃，链中后续健康模型被漏选。
  */
-export function pickAvailableModel(plan: RouteExecutionPlan, cooldowns: CooldownSet): string | undefined {
+export function pickAvailableModel(
+  plan: RouteExecutionPlan,
+  cooldowns: CooldownSet,
+  extraOk?: (selector: string) => boolean,
+): string | undefined {
   for (const attempt of plan.attempts) {
     if (!attempt.selector) continue;
-    if (!cooldowns.isCooldown(attempt.selector)) return attempt.selector;
+    if (cooldowns.isCooldown(attempt.selector)) continue;
+    if (extraOk && !extraOk(attempt.selector)) continue;
+    return attempt.selector;
   }
   return undefined;
 }
